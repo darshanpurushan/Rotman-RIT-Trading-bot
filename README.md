@@ -1,6 +1,5 @@
-# Smart Order Routing & Institutional Tender Execution
+# Rotman Interactive Trader (RIT) | Python Algorithmic Trading Strategy
 
-### Rotman Interactive Trader (RIT) | Python Algorithmic Trading Strategy
 
 ## Overview
 
