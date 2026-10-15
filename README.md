@@ -93,6 +93,16 @@ For ALGO2, Ctrl+C requests cancellation and flattening while the market is activ
 
 ALGO2's 30 offline tests cover partial fills, position bounds, stale positions, order-status 404 fallbacks, lost responses, restart blocking, passive quote prices, configured quote-size bounds, midpoint sampling, state-write recovery and closeout sizing. ALGO3's 67 tests cover tender admission, liquidity heuristics, timing, cancellation and pending-order protection. Tests use controlled API behavior and do not establish live profitability or queue performance. The cleanup adds no new performance claim; quote sizes below 500 shares and dry-run midpoint sampling now follow the configured behavior, and unchanged ALGO2 state no longer triggers repeated disk writes.
 
+### Code quality
+
+Optional development checks use the repository's formatter and import/lint configuration:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m pip install -r requirements-dev.txt
+& ".\.venv\Scripts\python.exe" -m black --check algo2_market_maker.py algo3_router.py test_algo2.py test_router.py
+& ".\.venv\Scripts\python.exe" -m ruff check algo2_market_maker.py algo3_router.py test_algo2.py test_router.py
+```
+
 ## Practical limitations
 
 - **Queue and price risk:** quotes may fill predominantly on one side during a trend. The price can move between a book check and order arrival, so an intended passive order can still take liquidity; the API does not provide atomic post-only protection here.
