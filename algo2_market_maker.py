@@ -389,6 +389,7 @@ class Bot:
         if not self.live:
             p = int(self.api.security(self.c.ticker)["position"])
             b = self.api.book(self.c.ticker)
+            self.observe_book(b)
             self.log(
                 "dry_run",
                 tick=tick,

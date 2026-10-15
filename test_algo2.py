@@ -91,6 +91,13 @@ class Tests(unittest.TestCase):
         self.bot.observe_book(b)
         self.assertFalse(self.bot.history)
 
+    def test_dry_run_updates_history_without_orders(self):
+        self.bot.live = False
+        with patch("algo2_market_maker.time.monotonic", return_value=10):
+            self.bot.step(50)
+        self.assertAlmostEqual(self.bot.history[-1], 10.025)
+        self.assertFalse(self.api.posts)
+
     def test_capacity_partial(self):
         self.assertEqual(
             capacity(10000, [order(quantity=5000, filled=2000)], 20000), (7000, 30000)
