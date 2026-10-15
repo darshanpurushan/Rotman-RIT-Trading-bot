@@ -63,7 +63,6 @@ class API:
                 raise RuntimeError(
                     "Open THOR order exists; reconcile before another order"
                 )
-        if method == "POST" and path == "/orders":
             self.pending_order = dict(
                 order_id=None,
                 before=before,
