@@ -8,3 +8,8 @@ __pycache__/
 .DS_Store
 reports/
 *.pdf
+
+
+# Runtime execution reservations
+algo2_state.json
+algo2_state.tmp

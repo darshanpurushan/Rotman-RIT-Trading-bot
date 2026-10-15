@@ -1,5 +1,10 @@
 # Development history
 
+## ALGO2 v1.1 — Market making and order visibility
+Adds a separate inventory-aware ALGO market maker with passive quotes, outstanding-order exposure checks, a persistent submission reservation, automatic case-start monitoring and staged closeout. Individual-order 404 responses fall back to status-filtered order lists. Includes 22 offline tests. Positive practice P&L is user-reported; no ALGO2 report has been archived for numerical comparison.
+
+## ALGO3 history
+
 ## v12 — Pending order reservations
 Retains unresolved submissions across recovery to prevent additional orders against inventory that has not yet reflected a delayed fill. Adds regression coverage for a 25,000-share delayed fill and a potential 10,300-share overshoot. 66 offline tests.
 
@@ -17,3 +22,4 @@ Explored cross-venue entries and short-term directional signals. These strategie
 
 ## Earlier revisions
 Added shared-inventory accounting, short-tender hedging, end-of-round liquidation, partial-fill reconciliation, missing-order handling, price-level aggregation and automatic case-start monitoring.
+
