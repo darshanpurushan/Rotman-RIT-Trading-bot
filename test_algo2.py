@@ -6,7 +6,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 import requests
-from algo2_market_maker import Bot, Config, Uncertain, capacity, quotes
+from algo2_market_maker import (
+    Bot,
+    Config,
+    Uncertain,
+    VisibilityPending,
+    capacity,
+    quotes,
+)
 
 
 def order(oid=1, action="BUY", quantity=4000, filled=0, status="OPEN", price=10):
@@ -22,7 +29,10 @@ def order(oid=1, action="BUY", quantity=4000, filled=0, status="OPEN", price=10)
 
 
 def book():
-    return {"bids": [order(price=10)], "asks": [order(2, "SELL", price=10.05)]}
+    return {
+        "bids": [order(100001, price=10)],
+        "asks": [order(100002, "SELL", price=10.05)],
+    }
 
 
 class Fake:
@@ -286,8 +296,13 @@ class Tests(unittest.TestCase):
             raise requests.HTTPError(response=r)
 
         self.api.call = call
-        with self.assertRaises(Uncertain):
-            self.bot.submit("BUY", 4000, 10)
+        self.bot.submit("BUY", 4000, 10)
+        with patch(
+            "algo2_market_maker.time.monotonic",
+            return_value=self.bot.records["1"]["created"] + 2,
+        ):
+            with self.assertRaises(VisibilityPending):
+                self.bot.submit("BUY", 4000, 10)
         self.assertIn("1", self.bot.records)
         self.assertEqual(len(self.api.posts), 1)
 
@@ -312,6 +327,224 @@ class Tests(unittest.TestCase):
         self.bot.step(51)
         self.assertFalse(self.bot.closing)
         self.assertTrue(any(o["action"] == "SELL" for o in self.api.posts))
+
+    def test_publication_lag_keeps_both_quote_reservations(self):
+        clock = [100.0]
+        deletes = []
+        original = self.api.call
+        published = {}
+
+        def call(method, path, **kw):
+            if method == "POST":
+                result = original(method, path, **kw)
+                published[result["order_id"]] = clock[0] + 0.3
+                return result
+            if method == "DELETE":
+                deletes.append(path)
+            if method == "GET" and path == "/orders":
+                return [
+                    o.copy()
+                    for oid, o in self.api.rows.items()
+                    if o["status"] == kw["status"] and clock[0] >= published[oid]
+                ]
+            if method == "GET" and path.startswith("/orders/"):
+                oid = int(path.rsplit("/", 1)[1])
+                if clock[0] < published[oid]:
+                    response = requests.Response()
+                    response.status_code = 404
+                    raise requests.HTTPError(response=response)
+            return original(method, path, **kw)
+
+        self.api.call = call
+        self.api.orders = lambda _: [
+            o.copy()
+            for oid, o in self.api.rows.items()
+            if o["status"] == "OPEN" and clock[0] >= published[oid]
+        ]
+        with patch("algo2_market_maker.time.monotonic", side_effect=lambda: clock[0]):
+            self.bot.step(50)
+            self.assertEqual(len(self.api.posts), 2)
+            self.assertEqual({o["action"] for o in self.api.posts}, {"BUY", "SELL"})
+            position, opened = self.bot.reconcile()
+            self.assertEqual(capacity(position, opened, 20000), (16000, 16000))
+            clock[0] += 0.1
+            self.bot.step(50)
+            clock[0] += 0.3
+            self.bot.step(51)
+        self.assertFalse(deletes)
+        self.assertEqual(len(self.api.posts), 2)
+        self.assertFalse(self.bot.closing)
+
+    def test_old_competitive_quotes_keep_queue_position(self):
+        self.bot.step(50)
+        with patch(
+            "algo2_market_maker.time.monotonic",
+            return_value=max(r["created"] for r in self.bot.records.values()) + 10,
+        ):
+            self.bot.step(60)
+        self.assertEqual(len(self.api.posts), 2)
+        self.assertTrue(all(o["status"] == "OPEN" for o in self.api.rows.values()))
+
+    def test_repricing_cancels_only_changed_side(self):
+        self.bot.step(50)
+        old_sell = next(
+            o["order_id"] for o in self.api.rows.values() if o["action"] == "SELL"
+        )
+        newbook = book()
+        newbook["bids"][0]["price"] = 10.03
+        self.api.book = lambda _: newbook
+        with patch(
+            "algo2_market_maker.time.monotonic",
+            return_value=max(r["created"] for r in self.bot.records.values()) + 2,
+        ):
+            self.bot.step(52)
+        self.assertEqual(self.api.rows[old_sell]["status"], "OPEN")
+        self.assertIn(str(old_sell), self.bot.records)
+        self.assertEqual(len(self.bot.records), 1)
+
+    def test_read_timeout_does_not_stop_market_making(self):
+        active = {"status": "ACTIVE", "tick": 50}
+        later = {"status": "ACTIVE", "tick": 51}
+        stopped = {"status": "STOPPED", "tick": 300}
+        self.bot.started = True
+        with (
+            patch.object(
+                self.api,
+                "case",
+                side_effect=[active, requests.Timeout("read timeout"), later, stopped],
+            ),
+            patch.object(self.bot, "step") as step,
+            patch("algo2_market_maker.signal.signal"),
+            patch("algo2_market_maker.time.sleep"),
+        ):
+            self.bot.run()
+        self.assertEqual([c.args[0] for c in step.call_args_list], [50, 51])
+        self.assertFalse(self.bot.closing)
+
+    def test_ambiguous_post_timeout_still_blocks_orders(self):
+        original = self.api.call
+
+        def call(method, path, **kw):
+            if method == "POST":
+                raise requests.Timeout("lost POST response")
+            return original(method, path, **kw)
+
+        self.api.call = call
+        with self.assertRaises(requests.Timeout):
+            self.bot.submit("BUY", 4000, 10)
+        self.assertTrue(self.bot.unknown)
+        with self.assertRaises(Uncertain):
+            self.bot.submit("SELL", 4000, 10.04)
+
+    def test_visibility_wait_does_not_cancel_orders(self):
+        self.bot.submit("BUY", 4000, 10)
+        with patch.object(self.bot, "cancel") as cancel:
+            self.bot.wait_for_visibility(VisibilityPending("delayed snapshot"))
+        cancel.assert_not_called()
+        self.assertIn("1", self.bot.records)
+
+    def test_cancel_retry_is_paced(self):
+        self.bot.submit("BUY", 4000, 10)
+        self.bot.records["1"]["seen"] = True
+        self.bot.records["1"]["created"] = 0
+        original = self.api.call
+        deletes = []
+
+        def call(method, path, **kw):
+            if method == "DELETE":
+                deletes.append(path)
+                return {}
+            return original(method, path, **kw)
+
+        self.api.call = call
+        with patch("algo2_market_maker.time.monotonic", return_value=100):
+            for _ in range(2):
+                with self.assertRaises(VisibilityPending):
+                    self.bot.cancel()
+        self.assertEqual(len(deletes), 1)
+
+    def test_fill_is_logged_once(self):
+        self.bot.submit("BUY", 4000, 10)
+        self.api.rows[1]["quantity_filled"] = 1000
+        self.api.position = 1000
+        with patch.object(self.bot, "log") as log:
+            self.bot.reconcile()
+            self.bot.reconcile()
+        self.assertEqual(sum(c.args[0] == "fill" for c in log.call_args_list), 1)
+
+    def test_security_fee_configuration_overrides_defaults(self):
+        self.api.security = lambda _: {
+            "position": 0,
+            "max_trade_size": 5000,
+            "fee": 0.02,
+            "limit_order_rebate": 0.025,
+        }
+        self.bot.initialize()
+        self.assertEqual(self.bot.c.fee, 0.02)
+        self.assertEqual(self.bot.c.rebate, 0.025)
+
+    def test_no_rebate_quotes_cover_passive_fees(self):
+        q = quotes(book(), 0, [], Config(fee=0.01, rebate=0), 50)
+        self.assertGreater(q["SELL"][0] - q["BUY"][0], 0.02)
+
+    def test_slow_book_read_cannot_cross_entry_deadline(self):
+        with patch.object(
+            self.api,
+            "case",
+            side_effect=[
+                {"status": "ACTIVE", "tick": 259},
+                {"status": "ACTIVE", "tick": 260},
+            ],
+        ):
+            self.bot.submit("BUY", 4000, 10)
+        self.assertFalse(self.api.posts)
+        self.assertFalse(self.bot.unknown)
+
+    def test_no_post_after_tick_300(self):
+        self.bot.expected = self.api.position = 100
+        with patch.object(
+            self.api,
+            "case",
+            side_effect=[
+                {"status": "ACTIVE", "tick": 299},
+                {"status": "ACTIVE", "tick": 300},
+            ],
+        ):
+            self.bot.submit("SELL", 100)
+        self.assertFalse(self.api.posts)
+
+    def test_closeout_uses_exact_residual_and_ends_flat(self):
+        self.bot.expected = self.api.position = 10000
+        self.api.tick = 280
+        for residual in (6000, 2000, 0):
+            self.bot.step(280)
+            oid = max(self.api.rows)
+            self.api.rows[oid].update(
+                status="TRANSACTED", quantity_filled=self.api.rows[oid]["quantity"]
+            )
+            self.api.position = residual
+        self.bot.step(281)
+        self.assertEqual([o["quantity"] for o in self.api.posts], [4000, 4000, 2000])
+        self.assertEqual(self.bot.expected, 0)
+        self.assertFalse(self.bot.records)
+        self.assertFalse(self.bot.unknown)
+
+    def test_cancellation_wait_keeps_working_order_reserved(self):
+        self.bot.submit("BUY", 4000, 10)
+        self.bot.records["1"]["seen"] = True
+        original = self.api.call
+
+        def call(method, path, **kw):
+            if method == "DELETE":
+                return {}
+            return original(method, path, **kw)
+
+        self.api.call = call
+        with self.assertRaises(VisibilityPending):
+            self.bot.cancel(["1"])
+        self.bot.submit("BUY", 4000, 10)
+        self.assertEqual(len(self.api.posts), 1)
+        self.assertIn("1", self.bot.records)
 
     def test_terminal_fill(self):
         self.bot.submit("BUY", 4000, 10)

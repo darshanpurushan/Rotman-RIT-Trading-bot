@@ -1,4 +1,4 @@
-"""ALGO2 market maker v1.1. Python 3.10+, pip install requests.
+"""ALGO2 market maker v2.0. Python 3.10+, pip install requests.
 Run: python algo2_market_maker.py --live --confirmed
 RIT_API_KEY must contain your RIT client API key. Dry run is read-only.
 See ALGO2_README.md for strategy, recovery limits and case assumptions.
@@ -43,7 +43,11 @@ class Config:
     end: int = 300
     interval: float = 0.15
     rate: float = 5.0
-    rebate: float = 0.005
+    visibility_grace: float = 1.5
+    missing_timeout: float = 8.0
+    min_quote_life: float = 0.75
+    cancel_retry: float = 1.0
+    rebate: float = 0.015
     fee: float = 0.01
 
 
@@ -78,7 +82,7 @@ def quotes(book, position, history, cfg, tick):
     vol = statistics.pstdev(changes) if len(changes) >= 3 else 0
     trend = (values[-1] - values[0]) if len(values) > 1 else 0
     skew = max(-0.05, min(0.05, position / cfg.soft * 0.03))
-    half = max(0.005, min(0.05, 1.5 * vol))
+    half = max(0.005, cfg.fee - cfg.rebate + 0.005, min(0.05, 1.5 * vol))
     buy = min(bid + (0.01 if ask - bid >= 0.03 else 0), mid - half - skew, ask - 0.01)
     sell = max(ask - (0.01 if ask - bid >= 0.03 else 0), mid + half - skew, bid + 0.01)
     if trend < -0.04:
@@ -164,6 +168,8 @@ class Bot:
         self.started = False
         self.last_status = 0
         self._saved_state = None
+        self.last_wait = 0.0
+        self.last_wait_message = None
 
     def log(self, event, **kw):
         line = json.dumps(dict(time=time.time(), event=event, **kw))
@@ -199,6 +205,10 @@ class Bot:
         if self.c.size <= 0:
             raise RuntimeError("Invalid server order maximum")
         self.expected = int(sec["position"])
+        if sec.get("fee") is not None:
+            self.c.fee = float(sec["fee"])
+        if sec.get("limit_order_rebate") is not None:
+            self.c.rebate = float(sec["limit_order_rebate"])
         if self.live and self.path.exists():
             data = json.loads(self.path.read_text())
             if data.get("unknown") or data.get("records") or data.get("expected"):
@@ -239,14 +249,23 @@ class Bot:
             if result is None:
                 since = rec.setdefault("missing_since", time.monotonic())
                 self.save()
-                if time.monotonic() - since > 8:
+                if time.monotonic() - since > self.c.missing_timeout:
                     raise Uncertain(
                         f"Order {oid} still missing from status and lists; replacement blocked"
                     )
+                if time.monotonic() - rec["created"] <= self.c.visibility_grace:
+                    return dict(
+                        rec,
+                        order_id=oid,
+                        ticker=self.c.ticker,
+                        quantity_filled=rec["filled"],
+                        provisional=True,
+                    )
                 raise VisibilityPending(
-                    f"Order {oid} awaiting visibility; no replacement submitted"
+                    f"Order {oid} awaiting visibility; reservation retained"
                 )
         rec.pop("missing_since", None)
+        rec["seen"] = True
         if (
             result.get("action") != rec["action"]
             or int(result["quantity"]) != rec["quantity"]
@@ -257,19 +276,36 @@ class Bot:
     def reconcile(self):
         if self.unknown:
             raise Uncertain("Unknown POST outcome: further submissions blocked")
+        provisional = {}
         for oid, rec in list(self.records.items()):
             o = self.order_status(oid, rec)
+            if o.get("provisional"):
+                provisional[oid] = o
             if o.get("status") not in TERMINAL | {"OPEN"}:
                 raise Uncertain("Unknown order status")
             filled = int(o["quantity_filled"])
             if not rec["filled"] <= filled <= rec["quantity"]:
                 raise Uncertain("Invalid cumulative fill")
-            self.expected += (filled - rec["filled"]) * (
-                1 if rec["action"] == "BUY" else -1
-            )
+            delta = filled - rec["filled"]
+            self.expected += delta * (1 if rec["action"] == "BUY" else -1)
+            previous_status = rec["status"]
             rec["filled"] = filled
             rec["status"] = o["status"]
             self.save()
+            if delta:
+                self.log(
+                    "fill",
+                    order_id=oid,
+                    action=rec["action"],
+                    quantity=delta,
+                    cumulative=filled,
+                    position=self.expected,
+                    limit_price=rec["price"],
+                )
+            if rec["status"] in TERMINAL and previous_status not in TERMINAL:
+                self.log(
+                    "order_terminal", order_id=oid, status=rec["status"], filled=filled
+                )
         actual = int(self.api.security(self.c.ticker)["position"])
         if actual != self.expected:
             raise VisibilityPending(
@@ -286,25 +322,46 @@ class Bot:
             if self.records[oid]["status"] in TERMINAL and oid not in openids:
                 del self.records[oid]
         self.save()
+        # Unpublished known submissions still consume their full unfilled capacity.
+        # A later observed fill/position mismatch blocks writes until reconciled.
+        opened.extend(o for oid, o in provisional.items() if oid not in openids)
         return actual, opened
 
-    def cancel(self):
-        # Cancellation is safe to attempt even while fill/position snapshots disagree.
+    def cancel(self, order_ids=None):
+        selected = set(self.records) if order_ids is None else set(order_ids)
+        now = time.monotonic()
         for oid, rec in list(self.records.items()):
-            if rec["status"] in TERMINAL:
+            if oid not in selected or rec["status"] in TERMINAL:
                 continue
+            # Do not fire repeated DELETEs at an unpublished or cancelling order.
+            if not rec.get("seen") and now - rec["created"] < self.c.visibility_grace:
+                detail = self.order_status(oid, rec)
+                if detail.get("provisional") or detail["status"] in TERMINAL:
+                    continue
+            last_cancel = rec.get("cancel_requested")
+            if last_cancel is not None and now - last_cancel < self.c.cancel_retry:
+                continue
+            rec["cancel_requested"] = now
+            self.save()
             try:
                 self.api.call("DELETE", "/orders/" + oid)
-            except requests.RequestException as e:
-                self.log("cancel_pending", order_id=oid, error=str(e))
-        self.reconcile()
-        if self.records:
+            except requests.HTTPError as e:
+                if e.response is None or e.response.status_code != 404:
+                    raise
+                self.log(
+                    "cancel_pending", order_id=oid, error="Awaiting order visibility"
+                )
+        position, opened = self.reconcile()
+        if any(oid in self.records for oid in selected):
             raise VisibilityPending("Cancellation awaiting terminal confirmation")
+        return position, opened
 
     def submit(self, action, quantity, price=None):
         if not self.live:
             raise RuntimeError("Dry-run write blocked")
         position, opened = self.reconcile()
+        if any(o["action"] == action for o in opened):
+            return
         case = self.api.case()
         if case["status"] != "ACTIVE" or int(case["tick"]) >= self.c.end:
             return
@@ -340,6 +397,21 @@ class Bot:
                 for o in opened
             ):
                 return
+        # Book/status calls may cross a closeout boundary; recheck before writing.
+        latest = self.api.case()
+        if latest["status"] != "ACTIVE" or int(latest["tick"]) >= self.c.end:
+            return
+        if price is not None and int(latest["tick"]) >= self.c.flatten:
+            return
+        if self.closing or int(latest["tick"]) >= self.c.stop_entry:
+            if (action == "BUY" and position >= 0) or (
+                action == "SELL" and position <= 0
+            ):
+                return
+            reserved = sum(remaining(o) for o in opened if o["action"] == action)
+            qty = min(qty, max(0, abs(position) - reserved))
+        if qty <= 0:
+            return
         params = dict(
             ticker=self.c.ticker,
             action=action,
@@ -404,13 +476,19 @@ class Bot:
             return
         p, opened = self.reconcile()
         if self.closing or tick >= self.c.flatten:
-            self.cancel()
-            p, _ = self.reconcile()
+            p, _ = self.cancel()
             if p:
                 self.submit("SELL" if p > 0 else "BUY", abs(p))
             return
+        cancelling = [
+            oid
+            for oid, r in self.records.items()
+            if r.get("cancel_requested") is not None
+        ]
+        if cancelling:
+            self.cancel(cancelling)
+            return
         book = self.api.book(self.c.ticker)
-        # Exclude own order IDs so the bot does not chase its own quotes.
         for side in ("bids", "asks"):
             book[side] = [
                 o for o in book[side] if str(o.get("order_id")) not in self.records
@@ -418,29 +496,46 @@ class Bot:
         self.observe_book(book)
         target = quotes(book, p, self.history, self.c, tick)
         current = {o["action"]: o for o in opened}
-        changed = set(target) != set(current) or any(
-            abs(float(current[s]["price"]) - v[0]) >= 0.019
-            or remaining(current[s]) > v[1]
-            for s, v in target.items()
-            if s in current
-        )
-        aged = any(time.monotonic() - r["created"] > 3 for r in self.records.values())
-        if self.records and not changed and not aged:
-            return
-        self.cancel()
-        p, _ = self.reconcile()
-        # Recompute after cancellations and possible late fills.
-        target = quotes(self.api.book(self.c.ticker), p, self.history, self.c, tick)
+        now = time.monotonic()
+        for side, order in current.items():
+            oid = str(order["order_id"])
+            rec = self.records[oid]
+            wanted = target.get(side)
+            # Exposure reduction can cancel promptly; ordinary repricing waits.
+            remove = wanted is None or remaining(order) > wanted[1]
+            moved = (
+                wanted is not None and abs(float(order["price"]) - wanted[0]) >= 0.019
+            )
+            if remove or (moved and now - rec["created"] >= self.c.min_quote_life):
+                self.cancel([oid])
+                return
         sides = ["SELL", "BUY"] if p > 0 else ["BUY", "SELL"]
         for side in sides:
-            if side in target:
+            if side in target and side not in current:
                 self.submit(side, target[side][1], target[side][0])
-        if time.monotonic() - self.last_status > 3:
-            self.log("status", tick=tick, position=p, quotes=target)
+        if time.monotonic() - self.last_status >= 3:
+            self.log(
+                "status",
+                tick=tick,
+                position=self.expected,
+                quotes=target,
+                working_orders=len(self.records),
+                passive_pair_rebate=2 * (self.c.rebate - self.c.fee),
+            )
             self.last_status = time.monotonic()
 
+    def wait_for_visibility(self, error):
+        now = time.monotonic()
+        message = str(error)
+        if message != self.last_wait_message or now - self.last_wait >= 2:
+            self.log("visibility_wait", error=message)
+            self.last_wait = now
+            self.last_wait_message = message
+        # During normal publication lag, retain the quote and its reservation.
+        # Closing/late-case cancellation is retried by step(), without replaying POST.
+
     def run(self):
-        self.log("start", version="1.1-order-visibility", live=self.live)
+        self.log("start", version="2.0-publication-grace", live=self.live)
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "closing", True))
         while True:
             try:
@@ -466,19 +561,18 @@ class Bot:
                     self.log("shutdown_flat")
                     return
             except VisibilityPending as e:
-                self.log("visibility_wait", error=str(e))
-                # Keep reservations and retry fresh snapshots; do not abandon
-                # market making for a normal publication/cancellation delay.
-                if self.live and self.started:
-                    try:
-                        self.cancel()
-                    except (requests.RequestException, Uncertain) as ce:
-                        self.log("reconcile_wait", error=str(ce))
+                self.wait_for_visibility(e)
                 time.sleep(0.2)
+            except requests.RequestException as e:
+                self.log("api_wait", error=str(e), unknown_submission=self.unknown)
+                if self.unknown:
+                    self.closing = True
+                # A read timeout is not a new trading instruction or a permanent
+                # shutdown. Next iteration obtains fresh case/order/position data.
+                time.sleep(0.4)
             except RateLimited as e:
                 self.log("rate_limit", error=str(e))
             except (
-                requests.RequestException,
                 RuntimeError,
                 ValueError,
                 KeyError,

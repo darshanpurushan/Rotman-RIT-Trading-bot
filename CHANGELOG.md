@@ -1,5 +1,8 @@
 # Development history
 
+## ALGO2 v2.0 — Practice-report execution fixes
+Reviewed algomm1/algomm2 and matching event-log runs. Adds a 1.5-second known-ID publication grace with full remaining-quantity reservations, side-specific repricing, paced cancellation, continued operation after transient read timeouts, actual report fee/rebate defaults with live metadata overrides, fill diagnostics and immediate pre-POST deadline checks. 44 offline tests. Historical v1.1 reports: $429.28 and $383.00, one participant each, flat with zero limit fines. No v2.0 P&L improvement is claimed.
+
 ## Code cleanup and execution overhead
 - Format both bots and their tests consistently; remove unused imports and expand compressed control flow.
 - Keep ALGO2 quote sizes within the configured order size, including sizes below 500 shares.
@@ -30,5 +33,6 @@ Explored cross-venue entries and short-term directional signals. These strategie
 
 ## Earlier revisions
 Added shared-inventory accounting, short-tender hedging, end-of-round liquidation, partial-fill reconciliation, missing-order handling, price-level aggregation and automatic case-start monitoring.
+
 
 

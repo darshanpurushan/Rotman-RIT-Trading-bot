@@ -11,8 +11,8 @@ Python trading bots for two **Rotman Interactive Trader (RIT)** cases: market ma
 | Market | One stock: `ALGO` | One underlying across `THOR_M` and `THOR_A` |
 | Inventory control | Quote prices and quantities respond to current exposure | Child orders reduce accepted tender inventory |
 | Execution | Maintain passive buy/sell quotes, with market orders for closeout | Route child orders across venues using price, depth and fees |
-| Current version | v1.1, `1.1-order-visibility` | v12, pending-order reservations |
-| Offline tests | 30 | 67 |
+| Current version | v2.0, `2.0-publication-grace` | v12, pending-order reservations |
+| Offline tests | 44 | 67 |
 | Detailed guide | [ALGO2 guide](ALGO2_README.md) | [ALGO3 strategy](ALGO3_README.md) and [operations](OPERATIONS.md) |
 
 ## Selected practice results
@@ -24,7 +24,8 @@ The strongest documented ranking was **highest reported P&L among 10 participant
 | ALGO3 — `algo4` | 1st / highest P&L | 10 | $41,199.75 | Zero reported fines; final inventory zero |
 | ALGO3 — `algo3` | 1st / highest P&L | 8 | $18,755.02 | Zero reported fines; final inventory zero |
 | ALGO3 — `algo10mixedmanual` | 1st / highest P&L | 3 | $46,681.50 | Mixed manual tender decisions and bot execution; zero reported fines; final inventory zero |
-| ALGO2 — current practice feedback | Not yet documented | — | Positive P&L reported by the user; amount not supplied | v1.1 reported to be working well; performance report pending |
+| ALGO2 — `algomm1` | Single-participant practice | 1 | $429.28 | v1.1; 29 trades; zero limit fines; final inventory zero |
+| ALGO2 — `algomm2` | Single-participant practice | 1 | $383.00 | v1.1; 19 trades; zero limit fines; final inventory zero |
 
 Rankings are inferred from the trader P&L matching the report's simulation maximum and its participant count; the summary does not establish whether another participant tied. These are selected historical practice outcomes, not competition wins or results from a controlled benchmark. They span earlier ALGO3 versions and different liquidity conditions, so they do not establish the performance of the latest code. Some other rounds had missed opportunities, execution failures or fines. Raw reports and case PDFs are excluded from this repository.
 
@@ -40,9 +41,9 @@ The market maker aims to earn the spread as opposing orders fill over time. It c
 - **Persistent state:** write submission uncertainty and known orders to `algo2_state.json` before sending orders. An unknown submission outcome remains blocked after restart until independently reconciled.
 - **Closeout:** stop increasing inventory at tick 260; start sequential market-order liquidation at tick 275 and continue while the case is active.
 
-The supplied brief specifies a 5,000-share order maximum, a $0.01/share market-order fee, and a $0.005/share passive-fill rebate. Two passive legs therefore add a combined $0.01/share rebate to the captured price difference. Adverse price movement can more than offset the spread and rebates.
+The actual practice reports specify a 5,000-share order maximum, a $0.01/share fee and a $0.015/share passive rebate. The reports charge commission on all executed shares and credit rebates on passive volume, giving a net $0.005/share credit for a passive fill. Defaults now reflect these reports, and live security metadata overrides them when available.
 
-**Practice status:** the user reports that ALGO2 v1.1 works well with positive P&L. No numerical P&L, participant count or ranking is claimed until an ALGO2 performance report is available.
+**Practice status:** v1.1 earned $429.28 and $383.00 in the supplied single-participant reports, both ending flat with no position-limit fines. Their logs exposed immediate cancellation after normal publication delays and an early shutdown after a read timeout. v2.0 adds a 1.5-second known-order publication grace, preserves competitive opposite quotes, paces cancellation retries and resumes after transient read errors. Unknown POST outcomes remain blocked. [Read the evidence and changes](ALGO2_PRACTICE_REVIEW.md). No live P&L improvement is claimed for v2.0 yet.
 
 ## ALGO3: Tender evaluation and smart order routing
 
@@ -91,7 +92,7 @@ For ALGO2, Ctrl+C requests cancellation and flattening while the market is activ
 & ".\.venv\Scripts\python.exe" -m unittest test_router
 ```
 
-ALGO2's 30 offline tests cover partial fills, position bounds, stale positions, order-status 404 fallbacks, lost responses, restart blocking, passive quote prices, configured quote-size bounds, midpoint sampling, state-write recovery and closeout sizing. ALGO3's 67 tests cover tender admission, liquidity heuristics, timing, cancellation and pending-order protection. Tests use controlled API behavior and do not establish live profitability or queue performance. The cleanup adds no new performance claim; quote sizes below 500 shares and dry-run midpoint sampling now follow the configured behavior, and unchanged ALGO2 state no longer triggers repeated disk writes.
+ALGO2's 44 offline tests cover partial fills, position bounds, stale positions, order-status 404 fallbacks, lost responses, restart blocking, passive quote prices, configured quote-size bounds, midpoint sampling, state-write recovery and closeout sizing. ALGO3's 67 tests cover tender admission, liquidity heuristics, timing, cancellation and pending-order protection. Tests use controlled API behavior and do not establish live profitability or queue performance. The cleanup adds no new performance claim; quote sizes below 500 shares and dry-run midpoint sampling now follow the configured behavior, and unchanged ALGO2 state no longer triggers repeated disk writes.
 
 ### Code quality
 
@@ -109,8 +110,8 @@ Optional development checks use the repository's formatter and import/lint confi
 - **Execution uncertainty:** missing terminal records or inconsistent position snapshots can block further orders, including liquidation. Neither bot can guarantee a flat position or zero fines when the API is unavailable or the case ends first.
 - **Recovery differs between cases:** ALGO2 persists order reservations to disk and refuses unresolved previous sessions at startup. ALGO3 v12 reservations are process-local; restarting does not resolve an outstanding order.
 - **Heuristic parameters:** quote skews, volatility windows, liquidity discounts and refill assumptions have not been calibrated on a large independent execution dataset. Participant count and changing depth can alter outcomes materially.
-- **Case configuration:** verify fees, limits, symbols, rate limits and round length against the active simulation. ALGO2 defaults to five write requests per second and slows after explicit rate-limit rejection; the configured rate is not a claim about the server's maximum.
-- **Performance evidence:** the selected rankings are historical practice results. ALGO2's positive P&L is user-reported without a report; no Sharpe ratio, expected return or latest-version improvement is inferred.
+- **Case configuration:** verify fees, limits, symbols, rate limits and round length against the active simulation. ALGO2 defaults to the five orders per second documented in the supplied reports and slows after explicit rate-limit rejection.
+- **Performance evidence:** the selected rankings are historical practice results. ALGO2's two supplied positive-P&L reports are single-participant runs on v1.1; no Sharpe ratio, expected return or latest-version improvement is inferred.
 
 ## Repository files
 
@@ -129,4 +130,5 @@ Optional development checks use the repository's formatter and import/lint confi
 | `CHANGELOG.md` | Case-specific development history |
 
 Educational simulation software for RIT. Raw execution logs, runtime state, API credentials and copyrighted case documents are excluded from version control.
+
 
