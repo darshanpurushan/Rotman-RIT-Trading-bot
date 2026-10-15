@@ -68,6 +68,13 @@ class Tests(unittest.TestCase):
         self.bot = Bot(self.api, Config(), True, root / "state.json", root / "log")
         self.bot.initialize()
 
+    def test_small_configured_size_is_respected_in_quotes(self):
+        for size in (1, 100, 499, 500, 4000):
+            for position in (-11900, 0, 11900):
+                target = quotes(book(), position, [], Config(size=size), 50)
+                self.assertTrue(target)
+                self.assertTrue(all(0 < qty <= size for _, qty in target.values()))
+
     def test_capacity_partial(self):
         self.assertEqual(
             capacity(10000, [order(quantity=5000, filled=2000)], 20000), (7000, 30000)

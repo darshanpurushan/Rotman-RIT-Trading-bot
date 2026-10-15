@@ -86,8 +86,15 @@ def quotes(book, position, history, cfg, tick):
     if buy <= 0 or sell <= buy:
         return {}
     buycap, sellcap = capacity(position, [], cfg.limit)
-    bq = min(buycap, max(500, int(cfg.size * (1 - max(0, position) / cfg.soft))))
-    sq = min(sellcap, max(500, int(cfg.size * (1 - max(0, -position) / cfg.soft))))
+    floor = min(500, cfg.size)
+    bq = min(
+        buycap, cfg.size, max(floor, int(cfg.size * (1 - max(0, position) / cfg.soft)))
+    )
+    sq = min(
+        sellcap,
+        cfg.size,
+        max(floor, int(cfg.size * (1 - max(0, -position) / cfg.soft))),
+    )
     if position >= cfg.soft:
         bq = 0
     if position <= -cfg.soft:
