@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from collections import deque
 from pathlib import Path
+from unittest.mock import patch
 
 import requests
 from algo2_market_maker import Bot, Config, Uncertain, capacity, quotes
@@ -74,6 +75,21 @@ class Tests(unittest.TestCase):
                 target = quotes(book(), position, [], Config(size=size), 50)
                 self.assertTrue(target)
                 self.assertTrue(all(0 < qty <= size for _, qty in target.values()))
+
+    def test_history_ignores_fully_filled_levels(self):
+        b = book()
+        b["bids"].append(order(3, price=30, filled=4000))
+        b["asks"].append(order(4, "SELL", price=1, filled=4000))
+        with patch("algo2_market_maker.time.monotonic", return_value=10):
+            self.bot.observe_book(b)
+        self.assertAlmostEqual(self.bot.history[-1], 10.025)
+
+    def test_history_skips_locked_or_empty_book(self):
+        self.bot.observe_book({"bids": [], "asks": []})
+        b = book()
+        b["asks"][0]["price"] = 10
+        self.bot.observe_book(b)
+        self.assertFalse(self.bot.history)
 
     def test_capacity_partial(self):
         self.assertEqual(

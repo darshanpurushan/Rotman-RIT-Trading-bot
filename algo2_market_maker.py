@@ -58,21 +58,25 @@ def capacity(position, orders, limit):
     return max(0, limit - position - buys), max(0, limit + position - sells)
 
 
-def quotes(book, position, history, cfg, tick):
-    bids = [o for o in book["bids"] if remaining(o)]
-    asks = [o for o in book["asks"] if remaining(o)]
+def best_prices(book):
+    bids = [float(o["price"]) for o in book["bids"] if remaining(o)]
+    asks = [float(o["price"]) for o in book["asks"] if remaining(o)]
     if not bids or not asks:
+        return None
+    bid, ask = max(bids), min(asks)
+    return (bid, ask) if 0 < bid < ask else None
+
+
+def quotes(book, position, history, cfg, tick):
+    prices = best_prices(book)
+    if prices is None:
         return {}
-    bid = max(float(o["price"]) for o in bids)
-    ask = min(float(o["price"]) for o in asks)
-    if not (0 < bid < ask):
-        return {}
+    bid, ask = prices
     mid = (bid + ask) / 2
     values = list(history)
     changes = [b - a for a, b in zip(values, values[1:])]
     vol = statistics.pstdev(changes) if len(changes) >= 3 else 0
     trend = (values[-1] - values[0]) if len(values) > 1 else 0
-    # Trend protection changes quotes; it does not create directional entries.
     skew = max(-0.05, min(0.05, position / cfg.soft * 0.03))
     half = max(0.005, min(0.05, 1.5 * vol))
     buy = min(bid + (0.01 if ask - bid >= 0.03 else 0), mid - half - skew, ask - 0.01)
@@ -374,6 +378,13 @@ class Bot:
         self.save()
         self.log("order", order_id=oid, **params)
 
+    def observe_book(self, book):
+        prices = best_prices(book)
+        now = time.monotonic()
+        if prices is not None and now - self.last_history >= 0.2:
+            self.history.append(sum(prices) / 2)
+            self.last_history = now
+
     def step(self, tick):
         if not self.live:
             p = int(self.api.security(self.c.ticker)["position"])
@@ -398,19 +409,7 @@ class Bot:
             book[side] = [
                 o for o in book[side] if str(o.get("order_id")) not in self.records
             ]
-        if (
-            book["bids"]
-            and book["asks"]
-            and time.monotonic() - self.last_history >= 0.2
-        ):
-            self.history.append(
-                (
-                    max(float(o["price"]) for o in book["bids"])
-                    + min(float(o["price"]) for o in book["asks"])
-                )
-                / 2
-            )
-            self.last_history = time.monotonic()
+        self.observe_book(book)
         target = quotes(book, p, self.history, self.c, tick)
         current = {o["action"]: o for o in opened}
         changed = set(target) != set(current) or any(
