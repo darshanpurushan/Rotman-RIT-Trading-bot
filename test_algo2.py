@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from collections import deque
@@ -97,6 +98,38 @@ class Tests(unittest.TestCase):
             self.bot.step(50)
         self.assertAlmostEqual(self.bot.history[-1], 10.025)
         self.assertFalse(self.api.posts)
+
+    def test_unchanged_reconciliation_does_not_replace_state(self):
+        with patch("algo2_market_maker.os.replace") as replace:
+            self.bot.reconcile()
+            self.bot.reconcile()
+        replace.assert_not_called()
+
+    def test_changed_state_is_persisted(self):
+        self.bot.unknown = True
+        self.bot.save()
+        data = json.loads(self.bot.path.read_text())
+        self.assertTrue(data["unknown"])
+        self.bot.unknown = False
+        self.bot.save()
+        self.assertFalse(json.loads(self.bot.path.read_text())["unknown"])
+
+    def test_failed_state_replace_is_retried(self):
+        self.bot.unknown = True
+        previous = self.bot._saved_state
+        with patch(
+            "algo2_market_maker.os.replace", side_effect=OSError("disk failure")
+        ):
+            with self.assertRaises(OSError):
+                self.bot.save()
+        self.assertEqual(self.bot._saved_state, previous)
+        self.bot.save()
+        self.assertTrue(json.loads(self.bot.path.read_text())["unknown"])
+
+    def test_removed_state_file_is_recreated(self):
+        self.bot.path.unlink()
+        self.bot.save()
+        self.assertTrue(self.bot.path.exists())
 
     def test_capacity_partial(self):
         self.assertEqual(

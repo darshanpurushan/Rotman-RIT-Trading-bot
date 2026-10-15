@@ -163,6 +163,7 @@ class Bot:
         self.closing = False
         self.started = False
         self.last_status = 0
+        self._saved_state = None
 
     def log(self, event, **kw):
         line = json.dumps(dict(time=time.time(), event=event, **kw))
@@ -173,20 +174,24 @@ class Bot:
     def save(self):
         if not self.live:
             return
+        snapshot = json.dumps(
+            dict(
+                expected=self.expected,
+                records=self.records,
+                unknown=self.unknown,
+                ticker=self.c.ticker,
+            ),
+            sort_keys=True,
+        )
+        if snapshot == self._saved_state and self.path.exists():
+            return
         tmp = self.path.with_suffix(".tmp")
         with tmp.open("w", encoding="utf8") as f:
-            json.dump(
-                dict(
-                    expected=self.expected,
-                    records=self.records,
-                    unknown=self.unknown,
-                    ticker=self.c.ticker,
-                ),
-                f,
-            )
+            f.write(snapshot)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.path)
+        self._saved_state = snapshot
 
     def initialize(self):
         sec = self.api.security(self.c.ticker)
