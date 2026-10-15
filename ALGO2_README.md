@@ -33,7 +33,7 @@ A pair filled passively earns its price difference plus a combined $0.01/share r
 
 ## Execution and recovery
 
-Every submitted order is recorded in `algo2_state.json`; events go to `algo2_events.jsonl`. Use one bot process, one state file, and no concurrent manual orders on this account. It requires no open ALGO orders at startup. Existing inventory becomes the starting reconciliation baseline.
+Every submitted order is recorded in `algo2_state.json`; events go to `algo2_events.jsonl`. State changes are flushed to disk before transmission; unchanged reconciliation snapshots skip redundant file replacements. Quote sizes respect the configured size even below 500 shares. Midpoint sampling ignores fully filled rows in both live and dry-run modes. Use one bot process, one state file, and no concurrent manual orders on this account. It requires no open ALGO orders at startup. Existing inventory becomes the starting reconciliation baseline.
 
 Cancellation must be followed by terminal order status and matching position before replacement. Cumulative fills update expected inventory exactly once. Individual-order 404 responses fall back to OPEN, TRANSACTED and CANCELLED order lists. Temporary missing records, position publication lag and cancellation confirmation delays block submissions while snapshots are retried; known orders are cancelled to reduce exposure. Normal quoting can continue once reconciled. Missing records for more than eight seconds or an external order enters closeout recovery. Absence alone never proves a fill or cancellation.
 
@@ -54,3 +54,4 @@ REST has no atomic snapshot or guaranteed post-only behavior here. A price may m
 ```
 
 Offline tests cover position bounds, partial fills, stale position data, lost POST responses, restart blocking, passive prices, end-stage reduction, and dry-run behavior. They do not establish live profitability, queue behavior, throughput, or zero fines. This version has not been connected to your local RIT server. Start with a practice round and retain the JSONL log and performance report for tuning.
+

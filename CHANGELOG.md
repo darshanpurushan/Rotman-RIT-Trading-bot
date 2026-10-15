@@ -1,5 +1,13 @@
 # Development history
 
+## Code cleanup and execution overhead
+- Format both bots and their tests consistently; remove unused imports and expand compressed control flow.
+- Keep ALGO2 quote sizes within the configured order size, including sizes below 500 shares.
+- Ignore fully filled book rows when sampling midpoint history, and update that history during read-only observation.
+- Skip unchanged ALGO2 state-file replacements while retaining flush/fsync for changed state and retrying failed writes.
+- Serialize ALGO3 log events once for both outputs, flush console output, and consolidate the order-submission guard.
+- 30 ALGO2 tests and 67 ALGO3 tests pass offline. These changes have not been benchmarked for live P&L or latency.
+
 ## ALGO2 v1.1 — Market making and order visibility
 Adds a separate inventory-aware ALGO market maker with passive quotes, outstanding-order exposure checks, a persistent submission reservation, automatic case-start monitoring and staged closeout. Individual-order 404 responses fall back to status-filtered order lists. Includes 22 offline tests. Positive practice P&L is user-reported; no ALGO2 report has been archived for numerical comparison.
 
@@ -22,4 +30,5 @@ Explored cross-venue entries and short-term directional signals. These strategie
 
 ## Earlier revisions
 Added shared-inventory accounting, short-tender hedging, end-of-round liquidation, partial-fill reconciliation, missing-order handling, price-level aggregation and automatic case-start monitoring.
+
 

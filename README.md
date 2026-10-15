@@ -12,7 +12,7 @@ Python trading bots for two **Rotman Interactive Trader (RIT)** cases: market ma
 | Inventory control | Quote prices and quantities respond to current exposure | Child orders reduce accepted tender inventory |
 | Execution | Maintain passive buy/sell quotes, with market orders for closeout | Route child orders across venues using price, depth and fees |
 | Current version | v1.1, `1.1-order-visibility` | v12, pending-order reservations |
-| Offline tests | 22 | 66 |
+| Offline tests | 30 | 67 |
 | Detailed guide | [ALGO2 guide](ALGO2_README.md) | [ALGO3 strategy](ALGO3_README.md) and [operations](OPERATIONS.md) |
 
 ## Selected practice results
@@ -91,7 +91,7 @@ For ALGO2, Ctrl+C requests cancellation and flattening while the market is activ
 & ".\.venv\Scripts\python.exe" -m unittest test_router
 ```
 
-ALGO2's 22 offline tests cover partial fills, position bounds, stale positions, order-status 404 fallbacks, lost responses, restart blocking, passive quote prices and closeout sizing. ALGO3's 66 tests cover tender admission, liquidity heuristics, timing, cancellation and pending-order protection. Tests use controlled API behavior and do not establish live profitability or queue performance.
+ALGO2's 30 offline tests cover partial fills, position bounds, stale positions, order-status 404 fallbacks, lost responses, restart blocking, passive quote prices, configured quote-size bounds, midpoint sampling, state-write recovery and closeout sizing. ALGO3's 67 tests cover tender admission, liquidity heuristics, timing, cancellation and pending-order protection. Tests use controlled API behavior and do not establish live profitability or queue performance. The cleanup adds no new performance claim; quote sizes below 500 shares and dry-run midpoint sampling now follow the configured behavior, and unchanged ALGO2 state no longer triggers repeated disk writes.
 
 ## Practical limitations
 
@@ -119,3 +119,4 @@ ALGO2's 22 offline tests cover partial fills, position bounds, stale positions, 
 | `CHANGELOG.md` | Case-specific development history |
 
 Educational simulation software for RIT. Raw execution logs, runtime state, API credentials and copyrighted case documents are excluded from version control.
+
