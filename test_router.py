@@ -161,11 +161,11 @@ class StrategyTests(unittest.TestCase):
 
     def test_ambiguous_write_not_retried(self):
         a = r.API(True)
-        with patch.object(
-            a, "positions", return_value=dict.fromkeys(r.MARKETS, 100)
-        ), patch.object(a, "get", return_value=[]), patch.object(
-            a.s, "request", side_effect=r.requests.Timeout
-        ) as req:
+        with (
+            patch.object(a, "positions", return_value=dict.fromkeys(r.MARKETS, 100)),
+            patch.object(a, "get", return_value=[]),
+            patch.object(a.s, "request", side_effect=r.requests.Timeout) as req,
+        ):
             with self.assertRaises(r.requests.Timeout):
                 a.request(
                     "POST", "/orders", dict(ticker=r.MAIN, action="SELL", quantity=100)
@@ -218,16 +218,16 @@ class StrategyTests(unittest.TestCase):
                 self.accepted = True
 
         api = Fake()
-        with patch.object(r, "API", return_value=api), patch.object(
-            r, "API_KEY", "offline"
-        ), patch.object(r, "RECHECK_SECS", 0), patch.object(
-            r.time, "sleep"
-        ), patch.object(
-            r, "wait_positions", return_value={r.MAIN: -10000, r.ALT: -10000}
-        ), patch.object(
-            r, "cover"
-        ) as cover, patch.object(
-            r, "log"
+        with (
+            patch.object(r, "API", return_value=api),
+            patch.object(r, "API_KEY", "offline"),
+            patch.object(r, "RECHECK_SECS", 0),
+            patch.object(r.time, "sleep"),
+            patch.object(
+                r, "wait_positions", return_value={r.MAIN: -10000, r.ALT: -10000}
+            ),
+            patch.object(r, "cover") as cover,
+            patch.object(r, "log"),
         ):
             r.run(live=True, confirmed=True)
         self.assertEqual(api.writes, [("POST", "/tenders/1")])
@@ -326,10 +326,12 @@ class InventoryRegressionTests(unittest.TestCase):
                 raise RuntimeError("temporary reconciliation failure after tender")
             return original(*args, **kwargs)
 
-        with patch.object(r, "API", return_value=api), patch.object(
-            r, "API_KEY", "offline"
-        ), patch.object(r.time, "sleep"), patch.object(r, "log") as logs, patch.object(
-            r, "wait_positions", side_effect=wait
+        with (
+            patch.object(r, "API", return_value=api),
+            patch.object(r, "API_KEY", "offline"),
+            patch.object(r.time, "sleep"),
+            patch.object(r, "log") as logs,
+            patch.object(r, "wait_positions", side_effect=wait),
         ):
             r.run(True, True)
         return logs
@@ -509,9 +511,10 @@ class MissingOrderTests(unittest.TestCase):
 
     def test_flat_logging_throttled_without_skipping_checks(self):
         a = MirroredExchange()
-        with patch.object(r.time, "monotonic", side_effect=[10, 11, 16]), patch.object(
-            r, "log"
-        ) as logs:
+        with (
+            patch.object(r.time, "monotonic", side_effect=[10, 11, 16]),
+            patch.object(r, "log") as logs,
+        ):
             for _ in range(3):
                 r.log_flat(a, a.positions())
         self.assertEqual(logs.call_count, 2)
@@ -669,9 +672,10 @@ class ExposureGuardTests(unittest.TestCase):
 
     def test_live_boundary_blocks_before_write(self):
         a = r.API(True)
-        with patch.object(
-            a, "positions", return_value=dict.fromkeys(r.MARKETS, 0)
-        ), patch.object(a.s, "request") as req:
+        with (
+            patch.object(a, "positions", return_value=dict.fromkeys(r.MARKETS, 0)),
+            patch.object(a.s, "request") as req,
+        ):
             with self.assertRaises(RuntimeError):
                 a.request(
                     "POST", "/orders", dict(ticker=r.ALT, action="BUY", quantity=100)
@@ -680,11 +684,11 @@ class ExposureGuardTests(unittest.TestCase):
 
     def test_open_order_blocks_second_write(self):
         a = r.API(True)
-        with patch.object(
-            a, "positions", return_value=dict.fromkeys(r.MARKETS, 100)
-        ), patch.object(a, "get", return_value=[dict(ticker=r.MAIN)]), patch.object(
-            a.s, "request"
-        ) as req:
+        with (
+            patch.object(a, "positions", return_value=dict.fromkeys(r.MARKETS, 100)),
+            patch.object(a, "get", return_value=[dict(ticker=r.MAIN)]),
+            patch.object(a.s, "request") as req,
+        ):
             with self.assertRaises(RuntimeError):
                 a.request(
                     "POST", "/orders", dict(ticker=r.ALT, action="SELL", quantity=100)
@@ -814,9 +818,12 @@ class TimingAndVisibilityRegressionTests(unittest.TestCase):
 
         a = Fake()
         after = dict.fromkeys(r.MARKETS, -100)
-        with patch.object(r, "stable_positions", return_value=after), patch.object(
-            r, "cancel_order"
-        ), patch.object(r.time, "sleep"), patch.object(r, "log"):
+        with (
+            patch.object(r, "stable_positions", return_value=after),
+            patch.object(r, "cancel_order"),
+            patch.object(r.time, "sleep"),
+            patch.object(r, "log"),
+        ):
             self.assertEqual(
                 r.reconcile_missing_order(
                     a, 99, dict.fromkeys(r.MARKETS, 0), "SELL", 100
@@ -830,10 +837,13 @@ class TimingAndVisibilityRegressionTests(unittest.TestCase):
             def get(self, path, params=None):
                 return [dict(order_id=99, ticker=r.MAIN)]
 
-        with patch.object(
-            r, "stable_positions", return_value=dict.fromkeys(r.MARKETS, -100)
-        ), patch.object(r, "cancel_order"), patch.object(r.time, "sleep"), patch.object(
-            r, "log"
+        with (
+            patch.object(
+                r, "stable_positions", return_value=dict.fromkeys(r.MARKETS, -100)
+            ),
+            patch.object(r, "cancel_order"),
+            patch.object(r.time, "sleep"),
+            patch.object(r, "log"),
         ):
             with self.assertRaisesRegex(RuntimeError, "bounded"):
                 r.reconcile_missing_order(
@@ -917,6 +927,22 @@ class PendingReservationTests(unittest.TestCase):
                     "POST", "/orders", dict(ticker=r.ALT, action="BUY", quantity=100)
                 )
         req.assert_not_called()
+
+
+class LoggingTests(unittest.TestCase):
+    def test_console_and_file_share_one_serialized_event(self):
+        with (
+            patch.object(r, "LOG") as logfile,
+            patch("builtins.print") as console,
+            patch.object(r.json, "dumps", wraps=r.json.dumps) as encode,
+        ):
+            r.log("test_event", quantity=123)
+        encode.assert_called_once()
+        line = console.call_args.args[0]
+        console.assert_called_once_with(line, flush=True)
+        logfile.open.return_value.__enter__.return_value.write.assert_called_once_with(
+            line + "\n"
+        )
 
 
 if __name__ == "__main__":

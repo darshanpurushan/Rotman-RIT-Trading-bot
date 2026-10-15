@@ -32,9 +32,10 @@ LOG = Path("algo3_events.jsonl")
 
 def log(event, **data):
     row = dict(time=time.time(), event=event, **data)
-    print(json.dumps(row))
+    line = json.dumps(row)
+    print(line, flush=True)
     with LOG.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(row) + "\n")
+        f.write(line + "\n")
 
 
 class API:
