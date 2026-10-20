@@ -4,6 +4,7 @@ Read OPERATIONS.md before live use. Dry-run is the default.
 
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -41,6 +42,9 @@ def log(event, **data):
 class API:
     def __init__(self, live=False):
         self.live = live
+        self.hedge_plan = None
+        self.pending_tender = None
+        self.tender_cache = {}
         self.latency = 0.15
         self.child_seconds = 0.6
         self.liquidity = LiquidityEstimator()
@@ -68,6 +72,8 @@ class API:
                 before=before,
                 action=params["action"],
                 quantity=int(params["quantity"]),
+                ticker=params["ticker"],
+                price=params.get("price"),
             )
         for attempt in range(5 if method == "GET" else 1):
             started = time.monotonic()
@@ -284,6 +290,18 @@ def estimate_unwind(t, books, profile):
         credited_refill_shares=refill,
         allowed_unobserved_shares=allowed_missing,
     )
+    raw_coverage = min(qty, sum(q for _, q, _ in aggregate(books, buying)))
+    observed_capacity = min(
+        int(qty * 0.75), int(profile.get("recent_execution_capacity", 0))
+    )
+    allowed_missing = max(allowed_missing, raw_coverage - filled)
+    if filled >= qty * 0.25:
+        allowed_missing = max(allowed_missing, observed_capacity)
+    details.update(
+        current_displayed_coverage=raw_coverage,
+        recent_execution_capacity=observed_capacity,
+        allowed_unobserved_shares=allowed_missing,
+    )
     if not route or missing > allowed_missing:
         return None, details
     if missing:
@@ -362,6 +380,24 @@ def is_missing_order(exc):
         and exc.response is not None
         and exc.response.status_code == 404
     )
+
+
+def get_order_detail(api, oid):
+    try:
+        return api.get(f"/orders/{oid}")
+    except requests.HTTPError as exc:
+        if not is_missing_order(exc):
+            raise
+        for status in ("TRANSACTED", "CANCELLED", "OPEN"):
+            for order in api.get("/orders", {"status": status}):
+                if int(order["order_id"]) == oid and order.get("ticker") in MARKETS:
+                    log(
+                        "order_status_fallback",
+                        order_id=oid,
+                        status=order.get("status"),
+                    )
+                    return order
+        raise
 
 
 def reconcile_missing_order(api, oid, before, action, requested):
@@ -444,7 +480,7 @@ def execute_child(
     time.sleep(rest_seconds)
     source = "order_status"
     try:
-        order = api.get(f"/orders/{oid}")
+        order = get_order_detail(api, oid)
         if order["status"] == "OPEN":
             cancel_order(api, oid)
         deadline = time.monotonic() + 3
@@ -454,7 +490,7 @@ def execute_child(
                     f"Order {oid} not terminal; inspect before restarting"
                 )
             time.sleep(0.1)
-            order = api.get(f"/orders/{oid}")
+            order = get_order_detail(api, oid)
         filled = int(order["quantity_filled"])
     except requests.HTTPError as exc:
         if not is_missing_order(exc):
@@ -465,6 +501,8 @@ def execute_child(
         raise RuntimeError(f"Invalid reported fill for order {oid}: {filled}")
     if getattr(api, "pending_order", None):
         resolve_pending_order(api, order if source == "order_status" else None)
+    else:
+        credit_hedge_fill(api, ticker, action, filled, price)
     if hasattr(api, "liquidity") and price is not None and rest_seconds <= 0.1:
         api.liquidity.record_fill(filled, quantity)
     log(
@@ -494,7 +532,9 @@ def resolve_pending_order(api, known_detail=None):
             "Uncertain order submission without ID: new orders blocked; inspect RIT"
         )
     try:
-        detail = known_detail if known_detail is not None else api.get(f"/orders/{oid}")
+        detail = (
+            known_detail if known_detail is not None else get_order_detail(api, oid)
+        )
     except requests.HTTPError as exc:
         if not is_missing_order(exc):
             raise
@@ -532,6 +572,9 @@ def resolve_pending_order(api, known_detail=None):
         raise RuntimeError(
             f"Pending order {oid}: order list changed; reservation retained"
         )
+    credit_hedge_fill(
+        api, pending.get("ticker"), pending["action"], delta, pending.get("price")
+    )
     api.pending_order = None
     log(
         "pending_order_resolved",
@@ -548,7 +591,7 @@ def cancel_order(api, oid):
     except requests.HTTPError as cancel_error:
         # A fill can win the cancellation race. Confirm that before proceeding.
         try:
-            order = api.get(f"/orders/{oid}")
+            order = get_order_detail(api, oid)
         except requests.HTTPError as read_error:
             if not is_missing_order(read_error):
                 raise
@@ -591,6 +634,123 @@ def stable_positions(api, seconds=3):
     raise RuntimeError(f"Position snapshot did not stabilize: {last}")
 
 
+def begin_hedge_plan(api, tender, books, tick, source="accepted_tender"):
+    buying = tender["action"] == "SELL"
+    profile = (getattr(api, "liquidity", None) or LiquidityEstimator()).profile(
+        buying, 10
+    )
+    edge, _ = estimate_unwind(tender, books, profile)
+    plan = dict(
+        tender_id=tender.get("tender_id"),
+        action=tender["action"],
+        entry_price=float(tender["price"]),
+        quantity=int(tender["quantity"]),
+        profit_bound=0.0,
+        keep_profit=max(1.0, max(0.0, edge or 0) * 0.10),
+        soft_deadline=min(
+            FLATTEN_TICK,
+            tick
+            + max(
+                8,
+                min(
+                    30,
+                    int(
+                        execution_budget(
+                            int(tender["quantity"]), getattr(api, "child_seconds", 0.6)
+                        )
+                    ),
+                ),
+            ),
+        ),
+        source=source,
+    )
+    api.hedge_plan = plan
+    log("hedge_plan", **plan)
+    return plan
+
+
+def credit_hedge_fill(api, ticker, action, filled, price):
+    plan = getattr(api, "hedge_plan", None)
+    if not plan or not filled or plan["profit_bound"] is None:
+        return
+    if price is None or ticker not in TAKE_FEE:
+        plan["profit_bound"] = None
+        return
+    if action != ("BUY" if plan["action"] == "SELL" else "SELL"):
+        raise RuntimeError("Hedge fill direction does not match tender plan")
+    per_share = (
+        plan["entry_price"] - price - TAKE_FEE[ticker]
+        if action == "BUY"
+        else price - TAKE_FEE[ticker] - plan["entry_price"]
+    )
+    plan["profit_bound"] += filled * per_share
+    log(
+        "hedge_budget",
+        tender_id=plan["tender_id"],
+        conservative_profit_bound=plan["profit_bound"],
+        target_profit=plan["keep_profit"],
+        remaining_budget_is_estimate=True,
+    )
+
+
+def protect_exit(api, books, buying, remaining, tick, ticker, price):
+    plan = getattr(api, "hedge_plan", None)
+    if not plan or plan["profit_bound"] is None or tick >= plan["soft_deadline"]:
+        return ticker, price, 0.1
+    if buying != (plan["action"] == "SELL"):
+        raise RuntimeError(
+            "Inventory direction changed; tender price attribution invalid"
+        )
+
+    def bound(venue):
+        allowance = (plan["profit_bound"] - plan["keep_profit"]) / max(1, remaining)
+        return (
+            plan["entry_price"] - TAKE_FEE[venue] + allowance
+            if buying
+            else plan["entry_price"] + TAKE_FEE[venue] - allowance
+        )
+
+    limit = bound(ticker)
+    if (buying and price <= limit) or (not buying and price >= limit):
+        return ticker, price, 0.1
+    # A patient, bounded quote replaces a blind sweep while time remains.
+    ticker = ALT
+    limit = bound(ticker)
+    price = (
+        math.floor((limit + 1e-9) * 100) / 100
+        if buying
+        else math.ceil((limit - 1e-9) * 100) / 100
+    )
+    if not 5 <= price <= 20:
+        raise RuntimeError(
+            "Protected exit outside case price bounds; manual review required"
+        )
+    log(
+        "profit_protection",
+        tick=tick,
+        tender_id=plan["tender_id"],
+        price=price,
+        quantity_remaining=remaining,
+        soft_deadline=plan["soft_deadline"],
+        source=plan["source"],
+    )
+    return ticker, price, 0.5
+
+
+def matching_manual_tender(api, position, tick):
+    action = "BUY" if position > 0 else "SELL"
+    candidates = [
+        t
+        for t in getattr(api, "tender_cache", {}).values()
+        if t.get("action") == action
+        and int(t.get("quantity", 0)) == abs(position)
+        and t.get("price") is not None
+        and t.get("ticker") in MARKETS
+        and tick <= int(t.get("expires", tick)) + 5
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def cover(api, before, after, liquidating=False):
     """Close shared underlying inventory, counting mirrored fields only once."""
     target = position_value(before)
@@ -620,7 +780,7 @@ def cover(api, before, after, liquidating=False):
             raise RuntimeError(f"Case ended before flattening: {p}")
         tick = int(case["tick"])
         urgent = tick >= URGENT_TICK
-        force = liquidating or tick >= FLATTEN_TICK
+        force = tick >= FLATTEN_TICK
         levels = aggregate(books, buying)
         if not levels and not urgent:
             time.sleep(POLL_SECS)
@@ -652,6 +812,10 @@ def cover(api, before, after, liquidating=False):
                     price=price,
                     seconds=rest,
                 )
+        if not urgent:
+            ticker, price, rest = protect_exit(
+                api, books, buying, abs(delta), tick, ticker, price
+            )
         # Every order must strictly reduce actual shared exposure, including recovery.
         change = qty if buying else -qty
         proposed = shifted(p, change)
@@ -692,6 +856,7 @@ def cover(api, before, after, liquidating=False):
         )
     if target == 0:
         log_flat(api, p, force=True)
+        api.hedge_plan = None
     else:
         log(
             "hedge_complete",
@@ -710,6 +875,10 @@ def record_hedge_timing(api, shares, seconds):
     recent = (getattr(api, "recent_hedge_rates", []) + [seconds / shares])[-3:]
     api.recent_hedge_rates = recent
     api.hedge_seconds_per_share = max(recent)
+    observations = getattr(api, "hedge_observations", [])
+    api.hedge_observations = (
+        observations + [(time.monotonic(), shares / max(0.1, seconds))]
+    )[-3:]
 
 
 def log_flat(api, p, force=False):
@@ -726,6 +895,14 @@ def recovery_step(api):
     resolve_pending_order(api)
     cancel_open_orders(api)
     p = stable_positions(api)
+    pending = getattr(api, "pending_tender", None)
+    if pending:
+        expected = shifted(pending["before"], pending["change"])
+        if p != expected:
+            raise RuntimeError(
+                "Uncertain tender submission: position not confirmed; no acceptance retry or rearm"
+            )
+        api.pending_tender = None
     if position_value(p):
         return cover(api, dict.fromkeys(MARKETS, 0), p, liquidating=True)
     log_flat(api, p)
@@ -744,10 +921,11 @@ def run(live=False, confirmed=False):
     closing = False
     final_check = None
     has_started = False
+    stop_requested = False
     waiting_log = -100.0
     log(
         "start",
-        version="12-pending-order-reservation",
+        version="13-profit-aware-recovery",
         live=live,
         base_url=BASE_URL,
         position_mode="mirrored",
@@ -789,9 +967,30 @@ def run(live=False, confirmed=False):
             p = api.positions()
             orders = api.get("/orders", {"status": "OPEN"})
             thor_orders = [o for o in orders if o.get("ticker") in MARKETS]
+            tenders = api.get("/tenders") if tick < NO_NEW_TENDERS_TICK else []
+            cache = getattr(api, "tender_cache", {})
+            cache.update({int(t["tender_id"]): dict(t) for t in tenders})
+            api.tender_cache = cache
             if live and (
                 recovery or tick >= FLATTEN_TICK or any(p.values()) or thor_orders
             ):
+                if any(p.values()) and not getattr(api, "hedge_plan", None):
+                    matched = matching_manual_tender(api, position_value(p), tick)
+                    if matched:
+                        begin_hedge_plan(
+                            api,
+                            matched,
+                            api.books(),
+                            tick,
+                            source="matched_recent_manual_tender",
+                        )
+                    else:
+                        log(
+                            "unattributed_inventory",
+                            tick=tick,
+                            positions=p,
+                            message="No unique tender price available; use depth-aware exits without claiming a profit floor",
+                        )
                 if not closing:
                     log(
                         "liquidation_mode",
@@ -802,13 +1001,41 @@ def run(live=False, confirmed=False):
                         ),
                     )
                     closing = True
-                # Once close-out begins, take no more tenders this round.
                 recovery = True
                 final_p = recovery_step(api)
                 final_check = dict(
                     tick=int(api.get("/case")["tick"]), positions=final_p
                 )
-                time.sleep(0.5)
+                fresh_tick = int(api.get("/case")["tick"])
+                if (
+                    stop_requested
+                    and not any(final_p.values())
+                    and not getattr(api, "pending_order", None)
+                    and not getattr(api, "pending_tender", None)
+                ):
+                    log("shutdown_flat", positions=final_p)
+                    return
+                if (
+                    not stop_requested
+                    and fresh_tick < NO_NEW_TENDERS_TICK
+                    and not any(final_p.values())
+                    and not getattr(api, "pending_order", None)
+                    and not getattr(api, "pending_tender", None)
+                    and not any(
+                        o.get("ticker") in MARKETS
+                        for o in api.get("/orders", {"status": "OPEN"})
+                    )
+                ):
+                    recovery = False
+                    closing = False
+                    api.hedge_plan = None
+                    log(
+                        "recovery_rearmed",
+                        tick=fresh_tick,
+                        positions=final_p,
+                        message="Flat and reconciled; tender evaluation resumes",
+                    )
+                time.sleep(0.2)
                 continue
             if time.monotonic() - heartbeat > 5:
                 heartbeat = time.monotonic()
@@ -816,7 +1043,7 @@ def run(live=False, confirmed=False):
             if tick >= NO_NEW_TENDERS_TICK:
                 time.sleep(POLL_SECS)
                 continue
-            for t in api.get("/tenders"):
+            for t in tenders:
                 tid = int(t["tender_id"])
                 now = time.monotonic()
                 if tid in seen or now - last_check.get(tid, -100) < RECHECK_SECS:
@@ -838,6 +1065,16 @@ def run(live=False, confirmed=False):
                     t.get("action") == "SELL",
                     execution_budget(int(t["quantity"]), speed),
                 )
+                observations = [
+                    (ts, rate)
+                    for ts, rate in getattr(api, "hedge_observations", [])
+                    if time.monotonic() - ts <= 120
+                ]
+                if observations:
+                    horizon = min(8, max(0, FLAT_TARGET_TICK - tick))
+                    profile["recent_execution_capacity"] = int(
+                        min(rate for _, rate in observations) * horizon * 0.5
+                    )
                 ok, reason, edge = should_accept(t, books, before, tick, speed, profile)
                 _, estimate_details = (
                     estimate_unwind(t, books, profile)
@@ -879,10 +1116,28 @@ def run(live=False, confirmed=False):
                 if not live or not ok:
                     continue
                 seen.add(tid)
-                api.request("POST", f"/tenders/{tid}")
-                log("tender_accepted", tender_id=tid)
                 change = int(t["quantity"]) * (1 if t["action"] == "BUY" else -1)
+                begin_hedge_plan(api, t, books, tick)
+                api.pending_tender = dict(tender_id=tid, before=before, change=change)
+                try:
+                    api.request("POST", f"/tenders/{tid}")
+                except requests.HTTPError as exc:
+                    if exc.response is not None and exc.response.status_code in (
+                        400,
+                        401,
+                        403,
+                        404,
+                        409,
+                        429,
+                    ):
+                        api.pending_tender = None
+                        api.hedge_plan = None
+                        if exc.response.status_code == 429:
+                            seen.discard(tid)
+                    raise
+                log("tender_accepted", tender_id=tid)
                 after = wait_positions(api, shifted(before, change))
+                api.pending_tender = None
                 flat = cover(api, before, after)
                 final_check = dict(tick=int(api.get("/case")["tick"]), positions=flat)
             time.sleep(POLL_SECS)
@@ -898,11 +1153,13 @@ def run(live=False, confirmed=False):
                 continue
             if not live:
                 raise
+            if isinstance(exc, KeyboardInterrupt):
+                stop_requested = True
             recovery = True
             log(
                 "recovery",
                 reason=str(exc),
-                action="Cancel open THOR orders, reconcile, flatten; no new tenders",
+                action="Reconcile uncertain writes, manage price-aware exits, resume only after verified flat",
             )
             # Stay alive while the case is active; transient read errors must not
             # abandon an accepted tender. Never blindly repeat an uncertain write.

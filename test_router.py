@@ -929,6 +929,297 @@ class PendingReservationTests(unittest.TestCase):
         req.assert_not_called()
 
 
+class RecoveryPolicyTests(unittest.TestCase):
+    def books(self):
+        return {
+            t: {
+                "asks": [{"price": 10.30, "quantity": 100000}],
+                "bids": [{"price": 10.29, "quantity": 100000}],
+            }
+            for t in r.MARKETS
+        }
+
+    def tender(self, quantity=75000):
+        return dict(
+            tender_id=215,
+            ticker=r.MAIN,
+            action="SELL",
+            quantity=quantity,
+            price=10.50,
+            expires=150,
+            is_fixed_bid=True,
+        )
+
+    def test_manual_recovery_rearms_and_accepts_next_tender(self):
+        class ManualThenTender(MirroredExchange):
+            def __init__(self):
+                super().__init__(action="SELL", initial=-75000, tick=100)
+                self.case_reads = 0
+                self.tender_cache = {
+                    1: dict(
+                        tender_id=1,
+                        ticker=r.MAIN,
+                        action="SELL",
+                        quantity=75000,
+                        price=20.2,
+                        expires=120,
+                    )
+                }
+
+            def get(self, path, params=None):
+                if path == "/case":
+                    self.case_reads += 1
+                    stopped = (
+                        self.accepted and self.position == 0
+                    ) or self.case_reads > 500
+                    return {
+                        "status": "STOPPED" if stopped else "ACTIVE",
+                        "tick": 150 if self.position == 0 else 100,
+                    }
+                if path == "/tenders":
+                    rows = super().get(path, params)
+                    return [dict(t, expires=180, tick=150) for t in rows]
+                return super().get(path, params)
+
+        api = ManualThenTender()
+        with (
+            patch.object(r, "API", return_value=api),
+            patch.object(r, "API_KEY", "offline"),
+            patch.object(r.time, "sleep"),
+            patch.object(r, "log") as log,
+        ):
+            r.run(True, True)
+        self.assertTrue(api.accepted)
+        self.assertEqual(api.position, 0)
+        self.assertTrue(
+            any(c.args[0] == "recovery_rearmed" for c in log.call_args_list)
+        )
+        self.assertEqual(sum(p["quantity_filled"] for p in api.orders.values()), 146000)
+
+    def test_user_interrupt_closes_and_exits_instead_of_rearming(self):
+        class Interrupted(MirroredExchange):
+            def __init__(self):
+                super().__init__()
+                self.interrupted = False
+                self.case_reads = 0
+
+            def get(self, path, params=None):
+                if path == "/case":
+                    self.case_reads += 1
+                    return {
+                        "status": "ACTIVE" if self.case_reads < 30 else "STOPPED",
+                        "tick": 100,
+                    }
+                if path == "/tenders":
+                    if not self.interrupted:
+                        self.interrupted = True
+                        raise KeyboardInterrupt()
+                    return []
+                return super().get(path, params)
+
+        api = Interrupted()
+        with (
+            patch.object(r, "API", return_value=api),
+            patch.object(r, "API_KEY", "offline"),
+            patch.object(r.time, "sleep"),
+            patch.object(r, "log") as log,
+        ):
+            r.run(True, True)
+        self.assertLess(api.case_reads, 10)
+        self.assertTrue(any(c.args[0] == "shutdown_flat" for c in log.call_args_list))
+        self.assertFalse(
+            any(c.args[0] == "recovery_rearmed" for c in log.call_args_list)
+        )
+
+    def test_ambiguous_tender_response_cannot_rearm_while_flat(self):
+        api = MirroredExchange()
+        api.pending_tender = dict(tender_id=1, before=api.positions(), change=-75000)
+        with patch.object(r.time, "sleep"), patch.object(r, "cover") as cover:
+            with self.assertRaisesRegex(RuntimeError, "Uncertain tender"):
+                r.recovery_step(api)
+        self.assertIsNotNone(api.pending_tender)
+        cover.assert_not_called()
+
+    def test_full_current_book_not_rejected_only_for_haircut(self):
+        books = {t: {"asks": [{"price": 10.30, "quantity": 40000}]} for t in r.MARKETS}
+        profile = r.LiquidityEstimator().profile(True, 10)
+        profile["depth_fraction"] = 0.5
+        t = self.tender(80000)
+        ok, _, edge = r.should_accept(
+            t, books, dict.fromkeys(r.MARKETS, 0), 100, profile=profile
+        )
+        self.assertTrue(ok)
+        self.assertGreater(edge, 0)
+        _, details = r.estimate_unwind(t, books, profile)
+        self.assertEqual(details["current_displayed_coverage"], 80000)
+
+    def test_thin_book_without_execution_evidence_still_rejected(self):
+        books = {t: {"asks": [{"price": 10.30, "quantity": 10000}]} for t in r.MARKETS}
+        profile = r.LiquidityEstimator().profile(True, 10)
+        self.assertFalse(
+            r.should_accept(
+                self.tender(80000),
+                books,
+                dict.fromkeys(r.MARKETS, 0),
+                100,
+                profile=profile,
+            )[0]
+        )
+
+    def test_completed_large_hedge_can_support_replenishing_depth(self):
+        books = {t: {"asks": [{"price": 10.30, "quantity": 12500}]} for t in r.MARKETS}
+        profile = r.LiquidityEstimator().profile(True, 10)
+        profile["recent_execution_capacity"] = 60000
+        self.assertTrue(
+            r.should_accept(
+                self.tender(80000),
+                books,
+                dict.fromkeys(r.MARKETS, 0),
+                100,
+                profile=profile,
+            )[0]
+        )
+
+    def test_recovery_price_guard_does_not_sweep_at_a_loss_immediately(self):
+        api = MirroredExchange()
+        with patch.object(r, "log"):
+            plan = r.begin_hedge_plan(api, self.tender(), self.books(), 100)
+            ticker, price, rest = r.protect_exit(
+                api, self.books(), True, 75000, 101, r.MAIN, 10.60
+            )
+        self.assertEqual(ticker, r.ALT)
+        self.assertLess(price + r.TAKE_FEE[ticker], plan["entry_price"])
+        self.assertEqual(rest, 0.5)
+
+    def test_soft_deadline_allows_completion_when_profit_target_unavailable(self):
+        api = MirroredExchange()
+        with patch.object(r, "log"):
+            plan = r.begin_hedge_plan(api, self.tender(), self.books(), 100)
+            ticker, price, rest = r.protect_exit(
+                api, self.books(), True, 75000, plan["soft_deadline"], r.MAIN, 10.60
+            )
+        self.assertEqual((ticker, price, rest), (r.MAIN, 10.60, 0.1))
+
+    def test_resolved_pending_fill_credits_profit_bound_once(self):
+        api = r.API(False)
+        api.hedge_plan = dict(
+            tender_id=1,
+            action="SELL",
+            entry_price=10.50,
+            profit_bound=0.0,
+            keep_profit=1.0,
+        )
+        api.pending_order = dict(
+            order_id=1,
+            before=dict.fromkeys(r.MARKETS, -100),
+            action="BUY",
+            quantity=100,
+            ticker=r.ALT,
+            price=10.0,
+        )
+
+        def get(path, params=None):
+            if path == "/orders":
+                return []
+            return dict(status="TRANSACTED", quantity_filled=100)
+
+        with (
+            patch.object(api, "get", side_effect=get),
+            patch.object(
+                r, "stable_positions", return_value=dict.fromkeys(r.MARKETS, 0)
+            ),
+            patch.object(r, "log"),
+        ):
+            r.resolve_pending_order(api)
+            r.resolve_pending_order(api)
+        self.assertAlmostEqual(api.hedge_plan["profit_bound"], 49.5)
+
+    def test_manual_price_match_requires_unique_quantity_and_direction(self):
+        api = MirroredExchange()
+        api.tender_cache = {1: self.tender()}
+        self.assertEqual(r.matching_manual_tender(api, -75000, 100)["price"], 10.50)
+        self.assertIsNone(r.matching_manual_tender(api, 75000, 100))
+        api.tender_cache[2] = dict(self.tender(), tender_id=2, price=10.6)
+        self.assertIsNone(r.matching_manual_tender(api, -75000, 100))
+
+    def test_cancelled_list_can_resolve_partial_fill_without_replay(self):
+        api = r.API(False)
+        api.pending_order = dict(
+            order_id=99,
+            before=dict.fromkeys(r.MARKETS, -100),
+            action="BUY",
+            quantity=100,
+            ticker=r.ALT,
+            price=10.0,
+        )
+
+        def get(path, params=None):
+            if path == "/orders/99":
+                raise missing_error()
+            if path == "/orders" and params["status"] == "CANCELLED":
+                return [
+                    dict(
+                        order_id=99,
+                        ticker=r.ALT,
+                        status="CANCELLED",
+                        quantity_filled=40,
+                    )
+                ]
+            return []
+
+        with (
+            patch.object(api, "get", side_effect=get),
+            patch.object(
+                r, "stable_positions", return_value=dict.fromkeys(r.MARKETS, -60)
+            ),
+            patch.object(r, "log"),
+        ):
+            r.resolve_pending_order(api)
+        self.assertIsNone(api.pending_order)
+
+    def test_wrong_order_in_terminal_list_does_not_release_reservation(self):
+        api = r.API(False)
+        api.pending_order = dict(
+            order_id=99,
+            before=dict.fromkeys(r.MARKETS, -100),
+            action="BUY",
+            quantity=100,
+            ticker=r.ALT,
+            price=10.0,
+        )
+
+        def get(path, params=None):
+            if path == "/orders/99":
+                raise missing_error()
+            if path == "/orders" and params["status"] == "CANCELLED":
+                return [
+                    dict(
+                        order_id=100,
+                        ticker=r.ALT,
+                        status="CANCELLED",
+                        quantity_filled=0,
+                    )
+                ]
+            return []
+
+        with (
+            patch.object(api, "get", side_effect=get),
+            patch.object(
+                r, "stable_positions", return_value=dict.fromkeys(r.MARKETS, -100)
+            ),
+            patch.object(r, "log"),
+        ):
+            with self.assertRaises(RuntimeError):
+                r.resolve_pending_order(api)
+        self.assertIsNotNone(api.pending_order)
+
+    def test_market_fill_does_not_claim_known_price_profit_bound(self):
+        api = MirroredExchange()
+        api.hedge_plan = dict(action="SELL", profit_bound=100.0)
+        r.credit_hedge_fill(api, r.ALT, "BUY", 100, None)
+        self.assertIsNone(api.hedge_plan["profit_bound"])
+
+
 class LoggingTests(unittest.TestCase):
     def test_console_and_file_share_one_serialized_event(self):
         with (
