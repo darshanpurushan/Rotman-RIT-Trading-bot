@@ -137,6 +137,17 @@ def aggregate(books, buying, fraction=1.0):
     return sorted(levels, key=lambda x: (x[0] if buying else -x[0], TAKE_FEE[x[2]]))
 
 
+def book_summary(books, levels=5):
+    """Public price/quantity diagnostics only; omit resting trader identifiers."""
+    return {
+        side: [
+            dict(price=p, quantity=q, ticker=t)
+            for p, q, t in aggregate(books, buying)[:levels]
+        ]
+        for side, buying in (("asks", True), ("bids", False))
+    }
+
+
 def walk(levels, qty, buying):
     remaining, value, route = qty, 0.0, []
     for price, available, ticker in levels:
@@ -520,6 +531,7 @@ def execute_child(
         filled=filled,
         price=price,
         fill_source=source,
+        price_is_submitted_limit=True,
         rest_seconds=rest_seconds,
     )
     if hasattr(api, "child_seconds"):
@@ -1230,6 +1242,7 @@ def run(live=False, confirmed=False):
                         estimated_edge=edge,
                         displayed_fraction=profile["depth_fraction"],
                         liquidity_estimate=estimate_details,
+                        book=book_summary(books),
                         execution_budget=execution_budget(int(t["quantity"]), speed),
                         tender_seconds_remaining=remaining,
                         profitable_and_eligible=profitable_and_eligible,
@@ -1265,7 +1278,15 @@ def run(live=False, confirmed=False):
                         if exc.response.status_code == 429:
                             seen.discard(tid)
                     raise
-                log("tender_accepted", tender_id=tid)
+                log(
+                    "tender_accepted",
+                    tender_id=tid,
+                    tick=tick,
+                    action=t["action"],
+                    quantity=int(t["quantity"]),
+                    price=float(t["price"]),
+                    source="bot",
+                )
                 after = wait_positions(api, shifted(before, change))
                 api.pending_tender = None
                 flat = cover(api, before, after)
