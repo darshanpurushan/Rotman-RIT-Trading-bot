@@ -278,3 +278,113 @@ class TerminalEvidenceTests(unittest.TestCase):
             {"success": True},
         ]:
             self.assertFalse(r.remember_terminal_order(api, record, 12, params))
+
+
+class EndToEndImprovementTests(unittest.TestCase):
+    def test_books_are_observed_even_without_tenders(self):
+        from test_router import InventoryRegressionTests, MirroredExchange
+
+        class IdleExchange(MirroredExchange):
+            def __init__(self):
+                super().__init__()
+                self.case_reads = 0
+                self.book_reads = 0
+                self.liquidity = r.LiquidityEstimator()
+
+            def get(self, path, params=None):
+                if path == "/case":
+                    self.case_reads += 1
+                    return dict(
+                        status="ACTIVE" if self.case_reads <= 10 else "STOPPED",
+                        tick=self.case_reads,
+                    )
+                if path == "/tenders":
+                    return []
+                return super().get(path, params)
+
+            def books(self):
+                self.book_reads += 1
+                value = super().books()
+                self.liquidity.observe(value)
+                return value
+
+        api = IdleExchange()
+        clock = iter(i * 0.2 for i in range(1000))
+        with patch.object(r.time, "monotonic", side_effect=lambda: next(clock)):
+            InventoryRegressionTests().run_exchange(api)
+        self.assertGreaterEqual(api.book_reads, 4)
+        self.assertFalse(api.writes)
+        self.assertGreaterEqual(len(api.liquidity.history), 4)
+
+    def test_terminal_post_record_avoids_missing_order_detail_and_keeps_active_timing(
+        self,
+    ):
+        from test_router import MirroredExchange
+
+        class TerminalExchange(MirroredExchange):
+            def request(self, method, path, params=None):
+                result = super().request(method, path, params)
+                if method == "POST" and path == "/orders":
+                    return dict(self.orders[result["order_id"]])
+                return result
+
+            def get(self, path, params=None):
+                if path.startswith("/orders/"):
+                    raise AssertionError(
+                        "Terminal POST response already confirms order"
+                    )
+                return super().get(path, params)
+
+        api = TerminalExchange(initial=-5000)
+        with patch.object(r.time, "sleep"), patch.object(r, "log"):
+            filled = r.execute_child(api, r.ALT, "BUY", 5000, 19.98, 1, api.positions())
+        self.assertEqual(filled, 5000)
+        self.assertEqual(api.position, 0)
+        self.assertEqual(api.child_seconds, 0.6)
+
+    def test_partial_fills_revalue_only_remaining_inventory(self):
+        api = r.API(False)
+        tender = dict(tender_id=1, action="BUY", quantity=10000, price=9.8)
+        with patch.object(r, "log"):
+            r.begin_hedge_plan(api, tender, books(), 100)
+            r.credit_hedge_fill(api, r.ALT, "SELL", 4000, 10)
+            projected = r.update_exit_value(api, books(), 6000, 101)
+        self.assertAlmostEqual(projected, 10000 * (10 - 0.005 - 9.8))
+        self.assertAlmostEqual(
+            api.hedge_plan["profit_bound"], 4000 * (10 - 0.005 - 9.8)
+        )
+
+    def test_replenishment_estimate_still_obeys_position_and_time_limits(self):
+        tender = dict(
+            tender_id=1,
+            ticker=r.MAIN,
+            action="SELL",
+            quantity=70000,
+            price=10.3,
+            expires=290,
+            is_fixed_bid=True,
+        )
+        profile = PatientAdmissionTests().profile()
+        book = books(quantity=15000)
+        book[r.MAIN]["asks"].append(dict(price=12, quantity=100000))
+        self.assertTrue(
+            r.should_accept(
+                tender, book, dict.fromkeys(r.MARKETS, 0), 100, profile=profile
+            )[0]
+        )
+        self.assertFalse(
+            r.should_accept(
+                tender, book, dict.fromkeys(r.MARKETS, 1), 100, profile=profile
+            )[0]
+        )
+        self.assertFalse(
+            r.should_accept(
+                tender, book, dict.fromkeys(r.MARKETS, 0), 270, profile=profile
+            )[0]
+        )
+        tender["quantity"] = 110000
+        self.assertFalse(
+            r.should_accept(
+                tender, book, dict.fromkeys(r.MARKETS, 0), 100, profile=profile
+            )[0]
+        )
