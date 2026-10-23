@@ -1006,6 +1006,31 @@ def unwind_schedule(api, initial, buying):
     return schedule
 
 
+def active_exit_child(api, books, buying, remaining, tick):
+    """Combine nearby same-venue levels without trading through another venue."""
+    levels = aggregate(books, buying)
+    if not levels:
+        return None
+    best, _, venue = levels[0]
+    seconds_left = max(1, FLAT_TARGET_TICK - tick)
+    desired = math.ceil(
+        remaining * max(0.2, getattr(api, "child_seconds", 0.6)) / seconds_left
+    )
+    cap = min(remaining, MAX_ORDER, max(CHILD_SIZE, min(10000, desired)))
+    quantity, limit = 0, best
+    for price, available, ticker in levels:
+        # Price priority across venues remains authoritative. Stop before the
+        # next venue; never sweep through a better competing displayed quote.
+        if ticker != venue or abs(price - best) > 0.01 + 1e-9:
+            break
+        take = min(cap - quantity, available)
+        quantity += take
+        limit = price
+        if quantity >= cap:
+            break
+    return venue, limit, quantity
+
+
 def choose_unwind_order(api, books, buying, remaining, tick, schedule):
     if tick >= URGENT_TICK:
         levels = aggregate(books, buying)
@@ -1094,7 +1119,7 @@ def choose_unwind_order(api, books, buying, remaining, tick, schedule):
             passive_price_advantage=advantage,
             observed_wait_cost=wait_cost,
         )
-    price, available, ticker = levels[0]
+    ticker, price, quantity = active_exit_child(api, books, buying, remaining, tick)
     reason = (
         "adverse_price_move"
         if schedule["adverse"]
@@ -1107,7 +1132,7 @@ def choose_unwind_order(api, books, buying, remaining, tick, schedule):
     return dict(
         ticker=ticker,
         price=price,
-        quantity=min(remaining, available, CHILD_SIZE, MAX_ORDER),
+        quantity=quantity,
         rest=0.1,
         passive=False,
         reason=reason,

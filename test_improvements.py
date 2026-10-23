@@ -181,3 +181,54 @@ class ExitValueTests(unittest.TestCase):
             api, books(bid=10.02, ask=10.04), False, 10000, 101, state
         )
         self.assertFalse(choice["passive"])
+
+
+class ActiveChildTests(unittest.TestCase):
+    def test_tiny_same_venue_quotes_combine_within_one_cent(self):
+        api = r.API(False)
+        book = {
+            r.MAIN: {
+                "asks": [dict(price=10, quantity=1), dict(price=10.01, quantity=9999)]
+            },
+            r.ALT: {"asks": [dict(price=10.02, quantity=10000)]},
+        }
+        self.assertEqual(
+            r.active_exit_child(api, book, True, 10000, 100), (r.MAIN, 10.01, 5000)
+        )
+
+    def test_competing_better_quote_prevents_trading_through(self):
+        api = r.API(False)
+        book = {
+            r.MAIN: {
+                "asks": [dict(price=10, quantity=1), dict(price=10.02, quantity=9999)]
+            },
+            r.ALT: {"asks": [dict(price=10.01, quantity=10000)]},
+        }
+        self.assertEqual(
+            r.active_exit_child(api, book, True, 10000, 100), (r.MAIN, 10, 1)
+        )
+
+    def test_residual_and_deadline_control_size(self):
+        api = r.API(False)
+        self.assertEqual(r.active_exit_child(api, books(), False, 123, 100)[2], 123)
+        api.child_seconds = 4
+        self.assertEqual(
+            r.active_exit_child(api, books(quantity=100000), False, 80000, 270)[2],
+            10000,
+        )
+
+    def test_sell_limit_never_reaches_past_one_cent(self):
+        api = r.API(False)
+        book = {
+            r.MAIN: {
+                "bids": [
+                    dict(price=10, quantity=1),
+                    dict(price=9.99, quantity=999),
+                    dict(price=9.98, quantity=20000),
+                ]
+            },
+            r.ALT: {},
+        }
+        self.assertEqual(
+            r.active_exit_child(api, book, False, 10000, 100), (r.MAIN, 9.99, 1000)
+        )
