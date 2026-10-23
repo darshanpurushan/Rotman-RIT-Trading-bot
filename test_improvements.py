@@ -232,3 +232,49 @@ class ActiveChildTests(unittest.TestCase):
         self.assertEqual(
             r.active_exit_child(api, book, False, 10000, 100), (r.MAIN, 9.99, 1000)
         )
+
+
+class TerminalEvidenceTests(unittest.TestCase):
+    def record(self, **updates):
+        result = dict(
+            order_id=12,
+            ticker=r.ALT,
+            quantity=5000,
+            quantity_filled=5000,
+            status="TRANSACTED",
+            action="BUY",
+        )
+        result.update(updates)
+        return result
+
+    def test_explicit_terminal_response_survives_missing_detail_endpoint(self):
+        api = r.API(False)
+        self.assertTrue(r.remember_terminal_order(api, self.record(), 12))
+        with patch.object(api, "get", side_effect=AssertionError("Unnecessary read")):
+            self.assertEqual(r.get_order_detail(api, 12)["quantity_filled"], 5000)
+
+    def test_cancelled_zero_fill_is_terminal_but_open_zero_fill_is_not(self):
+        api = r.API(False)
+        self.assertFalse(
+            r.remember_terminal_order(
+                api, self.record(status="OPEN", quantity_filled=0), 12
+            )
+        )
+        self.assertTrue(
+            r.remember_terminal_order(
+                api, self.record(status="CANCELLED", quantity_filled=0), 12
+            )
+        )
+
+    def test_wrong_id_quantity_or_side_cannot_cache_submission_evidence(self):
+        api = r.API(False)
+        params = dict(ticker=r.ALT, quantity=5000, action="BUY")
+        for record in [
+            self.record(order_id=13),
+            self.record(quantity_filled=6000),
+            self.record(quantity=6000, quantity_filled=6000),
+            self.record(action="SELL"),
+            self.record(quantity_filled=4999),
+            {"success": True},
+        ]:
+            self.assertFalse(r.remember_terminal_order(api, record, 12, params))

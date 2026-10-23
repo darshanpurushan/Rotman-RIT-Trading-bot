@@ -519,9 +519,52 @@ def is_missing_order(exc):
     )
 
 
-def get_order_detail(api, oid):
+def remember_terminal_order(api, record, expected_id, expected_params=None):
+    """Retain explicit terminal exchange evidence, never infer it from a 404."""
+    if not isinstance(record, dict) or record.get("status") not in (
+        "TRANSACTED",
+        "CANCELLED",
+    ):
+        return False
     try:
-        return api.get(f"/orders/{oid}")
+        oid = int(record["order_id"])
+        quantity, filled = record["quantity"], record["quantity_filled"]
+        if (
+            oid != expected_id
+            or record.get("ticker") not in MARKETS
+            or int(quantity) != quantity
+            or int(filled) != filled
+            or not 0 <= filled <= quantity <= MAX_ORDER
+            or quantity <= 0
+        ):
+            return False
+        if record["status"] == "TRANSACTED" and filled != quantity:
+            return False
+        if expected_params and (
+            record["ticker"] != expected_params["ticker"]
+            or quantity != expected_params["quantity"]
+            or record.get("action", expected_params["action"])
+            != expected_params["action"]
+        ):
+            return False
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    cache = getattr(api, "terminal_orders", {})
+    cache[oid] = dict(record)
+    while len(cache) > 64:
+        del cache[next(iter(cache))]
+    api.terminal_orders = cache
+    return True
+
+
+def get_order_detail(api, oid):
+    cached = getattr(api, "terminal_orders", {}).get(oid)
+    if cached is not None:
+        return dict(cached)
+    try:
+        record = api.get(f"/orders/{oid}")
+        remember_terminal_order(api, record, oid)
+        return record
     except requests.HTTPError as exc:
         if not is_missing_order(exc):
             raise
@@ -533,6 +576,7 @@ def get_order_detail(api, oid):
                         order_id=oid,
                         status=order.get("status"),
                     )
+                    remember_terminal_order(api, order, oid)
                     return order
         raise
 
@@ -613,6 +657,7 @@ def execute_child(
         params["price"] = price
     result = api.request("POST", "/orders", params)
     oid = int(result["order_id"])
+    remember_terminal_order(api, result, oid, params)
     # Marketable limit bounds price, but may rest. Cancel and confirm final fills.
     time.sleep(rest_seconds)
     source = "order_status"
@@ -654,7 +699,8 @@ def execute_child(
         price_is_submitted_limit=True,
         rest_seconds=rest_seconds,
     )
-    if hasattr(api, "child_seconds"):
+    if hasattr(api, "child_seconds") and rest_seconds <= 0.1:
+        # Passive waiting is budgeted separately; do not train active latency on it.
         api.child_seconds = max(
             0.2, 0.7 * api.child_seconds + 0.3 * (time.monotonic() - started)
         )
@@ -726,7 +772,8 @@ def resolve_pending_order(api, known_detail=None):
 
 def cancel_order(api, oid):
     try:
-        api.request("DELETE", f"/orders/{oid}")
+        result = api.request("DELETE", f"/orders/{oid}")
+        remember_terminal_order(api, result, oid)
     except requests.HTTPError as cancel_error:
         # A fill can win the cancellation race. Confirm that before proceeding.
         try:
