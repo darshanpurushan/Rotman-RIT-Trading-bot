@@ -350,7 +350,7 @@ class LiquidityEstimator:
         )
 
 
-def estimate_unwind(t, books, profile):
+def estimate_sweep(t, books, profile):
     qty = int(t["quantity"])
     buying = t["action"] == "SELL"
     levels = aggregate(books, buying, profile["depth_fraction"])
@@ -403,6 +403,65 @@ def estimate_unwind(t, books, profile):
         estimated_net_edge=edge - uncertainty,
     )
     return edge - uncertainty, details
+
+
+def estimate_unwind(t, books, profile):
+    """Compare an immediate sweep with a supported, bounded replenishment plan.
+
+    Future shares require recent additions near the current price. Participant
+    count, deep-book additions and prior hedge speed do not create cheap depth.
+    """
+    sweep_edge, details = estimate_sweep(t, books, profile)
+    details.update(
+        execution_model="sweep",
+        sweep_net_edge=sweep_edge,
+        patient_net_edge=None,
+        future_depth_guaranteed=False,
+    )
+    qty = int(t["quantity"])
+    buying = t["action"] == "SELL"
+    levels = aggregate(books, buying, profile["depth_fraction"])
+    if not levels or not profile.get("mature"):
+        return sweep_edge, details
+    touch = levels[0][0]
+    band = min(NEAR_PRICE_BAND, max(0, profile.get("near_price_band", 0)))
+    near = [level for level in levels if abs(level[0] - touch) <= band + 1e-9]
+    visible, value, route = walk(near, qty, buying)
+    missing = qty - visible
+    capacity = min(int(profile.get("near_refill_capacity", 0)), int(qty * 0.65))
+    if visible < qty * 0.25 or missing <= 0 or missing > capacity:
+        return sweep_edge, details
+    venue, _, worst_price = route[-1]
+    stress = max(profile["tail_stress"], 8 * profile.get("adverse_per_second", 0))
+    future_price = worst_price + (stress if buying else -stress)
+    if not 5 <= future_price <= 20:
+        return sweep_edge, details
+    value += missing * (
+        future_price + TAKE_FEE[venue] if buying else future_price - TAKE_FEE[venue]
+    )
+    uncertainty = qty * max(0.0025, stress * 0.10)
+    edge = (
+        qty * float(t["price"]) - value if buying else value - qty * float(t["price"])
+    ) - uncertainty
+    details.update(
+        patient_net_edge=edge,
+        patient_visible_shares=visible,
+        patient_future_shares=missing,
+        near_refill_capacity=capacity,
+        patient_future_price=future_price,
+    )
+    if sweep_edge is None or edge > sweep_edge:
+        details.update(
+            execution_model="observed_near_price_replenishment",
+            visible_shares=visible,
+            unobserved_shares=missing,
+            credited_refill_shares=missing,
+            estimated_hedge_value=value,
+            uncertainty_cost=uncertainty,
+            estimated_net_edge=edge,
+        )
+        return edge, details
+    return sweep_edge, details
 
 
 def should_accept(t, books, pos, tick, child_seconds=0.6, profile=None):
@@ -713,18 +772,30 @@ def stable_positions(api, seconds=3):
     raise RuntimeError(f"Position snapshot did not stabilize: {last}")
 
 
-def begin_hedge_plan(api, tender, books, tick, source="accepted_tender"):
+def begin_hedge_plan(
+    api,
+    tender,
+    books,
+    tick,
+    source="accepted_tender",
+    profile=None,
+    estimated_edge=None,
+):
     buying = tender["action"] == "SELL"
-    profile = (getattr(api, "liquidity", None) or LiquidityEstimator()).profile(
-        buying, 10
-    )
-    edge, _ = estimate_unwind(tender, books, profile)
+    profile = profile or (
+        getattr(api, "liquidity", None) or LiquidityEstimator()
+    ).profile(buying, 8)
+    edge, details = estimate_unwind(tender, books, profile)
+    if estimated_edge is not None:
+        edge = estimated_edge
     plan = dict(
         tender_id=tender.get("tender_id"),
         action=tender["action"],
         entry_price=float(tender["price"]),
         quantity=int(tender["quantity"]),
         profit_bound=0.0,
+        estimated_entry_edge=edge,
+        execution_model=details.get("execution_model"),
         keep_profit=max(1.0, max(0.0, edge or 0) * 0.10),
         soft_deadline=min(
             FLATTEN_TICK,
@@ -1327,7 +1398,9 @@ def run(live=False, confirmed=False):
                     continue
                 seen.add(tid)
                 change = int(t["quantity"]) * (1 if t["action"] == "BUY" else -1)
-                begin_hedge_plan(api, t, books, tick)
+                begin_hedge_plan(
+                    api, t, books, tick, profile=profile, estimated_edge=edge
+                )
                 api.pending_tender = dict(tender_id=tid, before=before, change=change)
                 try:
                     api.request("POST", f"/tenders/{tid}")
