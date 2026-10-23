@@ -25,7 +25,13 @@ NO_NEW_TENDERS_TICK = 260
 FLATTEN_TICK = 260
 URGENT_TICK = 275
 FLAT_TARGET_TICK = 285  # Reserve 15 seconds for cancellations/reconciliation.
-PASSIVE_SECONDS = 3.0
+PASSIVE_SECONDS = 1.0
+PASSIVE_TOTAL_SECONDS = 6.0
+PASSIVE_MAX_ATTEMPTS = 4
+PASSIVE_MAX_MISSES = 2
+PASSIVE_TARGET_FRACTION = 0.40
+PASSIVE_CHILD_SIZE = 10_000
+PASSIVE_ADVERSE_MOVE = 0.02
 RECHECK_SECS = 1.0
 POLL_SECS = 0.2
 LOG = Path("algo3_events.jsonl")
@@ -196,7 +202,7 @@ def execution_budget(qty, child_seconds=0.6):
     return max(
         12.0,
         ((qty + CHILD_SIZE - 1) // CHILD_SIZE) * child_seconds * 1.5
-        + PASSIVE_SECONDS
+        + PASSIVE_TOTAL_SECONDS
         + 5,
     )
 
@@ -514,6 +520,7 @@ def execute_child(
         filled=filled,
         price=price,
         fill_source=source,
+        rest_seconds=rest_seconds,
     )
     if hasattr(api, "child_seconds"):
         api.child_seconds = max(
@@ -693,10 +700,10 @@ def credit_hedge_fill(api, ticker, action, filled, price):
     )
 
 
-def protect_exit(api, books, buying, remaining, tick, ticker, price):
+def protect_exit(api, books, buying, remaining, tick, ticker, price, rest_seconds=0.1):
     plan = getattr(api, "hedge_plan", None)
     if not plan or plan["profit_bound"] is None or tick >= plan["soft_deadline"]:
-        return ticker, price, 0.1
+        return ticker, price, rest_seconds
     if buying != (plan["action"] == "SELL"):
         raise RuntimeError(
             "Inventory direction changed; tender price attribution invalid"
@@ -712,7 +719,7 @@ def protect_exit(api, books, buying, remaining, tick, ticker, price):
 
     limit = bound(ticker)
     if (buying and price <= limit) or (not buying and price >= limit):
-        return ticker, price, 0.1
+        return ticker, price, rest_seconds
     # A patient, bounded quote replaces a blind sweep while time remains.
     ticker = ALT
     limit = bound(ticker)
@@ -734,7 +741,7 @@ def protect_exit(api, books, buying, remaining, tick, ticker, price):
         soft_deadline=plan["soft_deadline"],
         source=plan["source"],
     )
-    return ticker, price, 0.5
+    return ticker, price, max(0.5, rest_seconds)
 
 
 def matching_manual_tender(api, position, tick):
@@ -751,12 +758,132 @@ def matching_manual_tender(api, position, tick):
     return candidates[0] if len(candidates) == 1 else None
 
 
+def passive_exit_quote(books, buying, remaining, target_left):
+    bids, asks = aggregate(books, False), aggregate(books, True)
+    if not bids or not asks or ALT not in books:
+        return None
+    bid, ask = bids[0][0], asks[0][0]
+    if bid >= ask:
+        return None
+    improve = 0.01 if ask - bid >= 0.03 - 1e-9 else 0.0
+    raw = min(bid + improve, ask - 0.01) if buying else max(ask - improve, bid + 0.01)
+    price = (
+        math.floor((raw + 1e-9) * 100) / 100
+        if buying
+        else math.ceil((raw - 1e-9) * 100) / 100
+    )
+    if (
+        not 5 <= price <= 20
+        or (buying and price >= ask)
+        or (not buying and price <= bid)
+    ):
+        return None
+    qty = min(int(remaining), int(target_left), PASSIVE_CHILD_SIZE, MAX_ORDER)
+    return (ALT, price, qty) if qty > 0 else None
+
+
+def unwind_schedule(api, initial, buying):
+    schedule = getattr(api, "unwind_schedule", None)
+    if (
+        schedule is None
+        or schedule["buying"] != buying
+        or initial > schedule["initial"]
+    ):
+        schedule = dict(
+            initial=initial,
+            buying=buying,
+            started=time.monotonic(),
+            attempts=0,
+            misses=0,
+            passive_filled=0,
+            midpoint=None,
+            adverse=False,
+        )
+        api.unwind_schedule = schedule
+    return schedule
+
+
+def choose_unwind_order(api, books, buying, remaining, tick, schedule):
+    if tick >= URGENT_TICK:
+        levels = aggregate(books, buying)
+        return dict(
+            ticker=levels[0][2] if levels else ALT,
+            price=None,
+            quantity=min(remaining, MAX_ORDER),
+            rest=0.1,
+            passive=False,
+            reason="urgent_deadline",
+        )
+    levels = aggregate(books, buying)
+    if not levels:
+        return None
+    bid, ask = aggregate(books, False), aggregate(books, True)
+    if bid and ask and bid[0][0] < ask[0][0]:
+        midpoint = (bid[0][0] + ask[0][0]) / 2
+        if schedule["midpoint"] is None:
+            schedule["midpoint"] = midpoint
+        movement = midpoint - schedule["midpoint"]
+        if (movement if buying else -movement) >= PASSIVE_ADVERSE_MOVE - 1e-9:
+            schedule["adverse"] = True
+    target_left = max(
+        0,
+        math.ceil(schedule["initial"] * PASSIVE_TARGET_FRACTION)
+        - schedule["passive_filled"],
+    )
+    elapsed = time.monotonic() - schedule["started"]
+    time_needed = execution_budget(
+        remaining, max(0.6, getattr(api, "child_seconds", 0.6))
+    )
+    plan = getattr(api, "hedge_plan", None)
+    can_wait = (
+        tick < FLATTEN_TICK
+        and FLATTEN_TICK - tick > time_needed + PASSIVE_SECONDS + 2
+        and elapsed + PASSIVE_SECONDS <= PASSIVE_TOTAL_SECONDS
+        and schedule["attempts"] < PASSIVE_MAX_ATTEMPTS
+        and schedule["misses"] < PASSIVE_MAX_MISSES
+        and not schedule["adverse"]
+        and target_left > 0
+        and (not plan or tick + PASSIVE_SECONDS < plan["soft_deadline"])
+    )
+    quote = (
+        passive_exit_quote(books, buying, remaining, target_left) if can_wait else None
+    )
+    if quote:
+        ticker, price, qty = quote
+        return dict(
+            ticker=ticker,
+            price=price,
+            quantity=qty,
+            rest=PASSIVE_SECONDS,
+            passive=True,
+            reason="bounded_passive_phase",
+        )
+    price, available, ticker = levels[0]
+    reason = (
+        "adverse_price_move"
+        if schedule["adverse"]
+        else (
+            "passive_no_fill"
+            if schedule["misses"] >= PASSIVE_MAX_MISSES
+            else "execution_schedule"
+        )
+    )
+    return dict(
+        ticker=ticker,
+        price=price,
+        quantity=min(remaining, available, CHILD_SIZE, MAX_ORDER),
+        rest=0.1,
+        passive=False,
+        reason=reason,
+    )
+
+
 def cover(api, before, after, liquidating=False):
     """Close shared underlying inventory, counting mirrored fields only once."""
     target = position_value(before)
     p = dict(after)
     initial = abs(position_value(p) - target)
-    passive_tried = False
+    schedule = unwind_schedule(api, initial, position_value(p) < target)
     started = time.monotonic()
     while position_value(p) != target:
         case = api.get("/case")
@@ -781,41 +908,39 @@ def cover(api, before, after, liquidating=False):
         tick = int(case["tick"])
         urgent = tick >= URGENT_TICK
         force = tick >= FLATTEN_TICK
-        levels = aggregate(books, buying)
-        if not levels and not urgent:
+        selection = choose_unwind_order(api, books, buying, abs(delta), tick, schedule)
+        if selection is None:
             time.sleep(POLL_SECS)
             continue
-        ticker = levels[0][2] if levels else ALT
-        rest = 0.1
-        if urgent:
-            # Completion takes priority: market children, never above case max.
-            price = None
-            qty = min(abs(delta), MAX_ORDER)
-        else:
-            price, available, ticker = levels[0]
-            qty = min(abs(delta), available, CHILD_SIZE, MAX_ORDER)
-        if (
-            not force
-            and not passive_tried
-            and abs(delta) <= initial * 0.4
-            and FLATTEN_TICK - tick > PASSIVE_SECONDS + 5
-        ):
-            passive_tried = True
-            same_side = aggregate({ALT: books[ALT]}, not buying)
-            if same_side:
-                ticker, price = ALT, same_side[0][0]
-                qty, rest = min(abs(delta), CHILD_SIZE), PASSIVE_SECONDS
-                log(
-                    "passive_tail",
-                    ticker=ticker,
-                    quantity=qty,
-                    price=price,
-                    seconds=rest,
-                )
+        ticker, price, qty, rest = (
+            selection[k] for k in ("ticker", "price", "quantity", "rest")
+        )
         if not urgent:
             ticker, price, rest = protect_exit(
-                api, books, buying, abs(delta), tick, ticker, price
+                api, books, buying, abs(delta), tick, ticker, price, rest_seconds=rest
             )
+        if selection["passive"]:
+            schedule["attempts"] += 1
+        log(
+            "unwind_order",
+            tick=tick,
+            ticker=ticker,
+            quantity=qty,
+            price=price,
+            execution_style=(
+                "passive_limit"
+                if selection["passive"]
+                else (
+                    "market"
+                    if urgent
+                    else "protected_limit" if rest > 0.1 else "marketable_limit"
+                )
+            ),
+            wait_seconds=rest,
+            reason=selection["reason"],
+            passive_attempts=schedule["attempts"],
+            passive_filled=schedule["passive_filled"],
+        )
         # Every order must strictly reduce actual shared exposure, including recovery.
         change = qty if buying else -qty
         proposed = shifted(p, change)
@@ -828,6 +953,10 @@ def cover(api, before, after, liquidating=False):
         filled = execute_child(
             api, ticker, "BUY" if buying else "SELL", qty, price, rest, before=p
         )
+        if selection["passive"]:
+            schedule["passive_filled"] += filled
+            if not filled:
+                schedule["misses"] += 1
         p = wait_positions(api, shifted(p, filled if buying else -filled))
         log(
             "inventory",
@@ -857,6 +986,7 @@ def cover(api, before, after, liquidating=False):
     if target == 0:
         log_flat(api, p, force=True)
         api.hedge_plan = None
+        api.unwind_schedule = None
     else:
         log(
             "hedge_complete",
@@ -925,7 +1055,7 @@ def run(live=False, confirmed=False):
     waiting_log = -100.0
     log(
         "start",
-        version="13-profit-aware-recovery",
+        version="14-passive-limit-unwind",
         live=live,
         base_url=BASE_URL,
         position_mode="mirrored",

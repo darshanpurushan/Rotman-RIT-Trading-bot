@@ -1220,6 +1220,167 @@ class RecoveryPolicyTests(unittest.TestCase):
         self.assertIsNone(api.hedge_plan["profit_bound"])
 
 
+class PassiveLimitUnwindTests(unittest.TestCase):
+    def books(self, bid=10.0, ask=10.05):
+        return {
+            t: {
+                "bids": [{"price": bid, "quantity": 100000}],
+                "asks": [{"price": ask, "quantity": 100000}],
+            }
+            for t in r.MARKETS
+        }
+
+    def selection(self, buying=False, tick=100, remaining=71000, **updates):
+        api = MirroredExchange()
+        state = r.unwind_schedule(api, 71000, buying)
+        state.update(updates)
+        return r.choose_unwind_order(api, self.books(), buying, remaining, tick, state)
+
+    def test_passive_quotes_improve_without_crossing(self):
+        for buying, expected in [(True, 10.01), (False, 10.04)]:
+            with self.subTest(buying=buying):
+                venue, price, qty = r.passive_exit_quote(
+                    self.books(), buying, 71000, 28000
+                )
+                self.assertEqual(venue, r.ALT)
+                self.assertAlmostEqual(price, expected)
+                self.assertEqual(qty, 10000)
+
+    def test_one_cent_spread_joins_quote(self):
+        self.assertAlmostEqual(
+            r.passive_exit_quote(self.books(10, 10.01), True, 100, 100)[1], 10
+        )
+        self.assertAlmostEqual(
+            r.passive_exit_quote(self.books(10, 10.01), False, 100, 100)[1], 10.01
+        )
+
+    def test_locked_or_missing_books_cannot_quote_passively(self):
+        for books in [self.books(10, 10), {}, {r.MAIN: self.books()[r.MAIN]}]:
+            self.assertIsNone(r.passive_exit_quote(books, True, 100, 100))
+
+    def test_passive_quantity_respects_residual_and_target(self):
+        self.assertEqual(r.passive_exit_quote(self.books(), False, 700, 900)[2], 700)
+        self.assertEqual(r.passive_exit_quote(self.books(), False, 700, 300)[2], 300)
+        self.assertIsNone(r.passive_exit_quote(self.books(), False, 700, 0))
+
+    def test_price_protection_preserves_selected_rest(self):
+        api = MirroredExchange()
+        self.assertEqual(
+            r.protect_exit(api, self.books(), False, 100, 100, r.ALT, 10.04, 1)[2], 1
+        )
+        api.hedge_plan = dict(
+            action="BUY",
+            profit_bound=100,
+            keep_profit=1,
+            entry_price=9,
+            soft_deadline=120,
+        )
+        self.assertEqual(
+            r.protect_exit(api, self.books(), False, 100, 100, r.ALT, 10.04, 1)[2], 1
+        )
+        self.assertEqual(
+            r.protect_exit(api, self.books(), False, 100, 121, r.ALT, 10.04, 1)[2], 1
+        )
+
+    def test_early_unwind_selects_one_second_limit(self):
+        choice = self.selection()
+        self.assertTrue(choice["passive"])
+        self.assertEqual(choice["rest"], 1)
+        self.assertIsNotNone(choice["price"])
+
+    def test_passive_phase_stops_at_each_budget(self):
+        for update in [
+            dict(misses=2),
+            dict(attempts=4),
+            dict(passive_filled=28400),
+            dict(started=r.time.monotonic() - 7),
+        ]:
+            with self.subTest(update=update):
+                choice = self.selection(**update)
+                self.assertFalse(choice["passive"])
+                self.assertIsNotNone(choice["price"])
+
+    def test_adverse_move_stops_waiting_in_both_directions(self):
+        for buying, bid, ask in [(True, 10.02, 10.07), (False, 9.98, 10.03)]:
+            api = MirroredExchange()
+            state = r.unwind_schedule(api, 71000, buying)
+            r.choose_unwind_order(api, self.books(), buying, 71000, 100, state)
+            choice = r.choose_unwind_order(
+                api, self.books(bid, ask), buying, 71000, 101, state
+            )
+            self.assertFalse(choice["passive"])
+            self.assertTrue(state["adverse"])
+            self.assertFalse(
+                r.choose_unwind_order(api, self.books(), buying, 71000, 102, state)[
+                    "passive"
+                ]
+            )
+
+    def test_closeout_uses_active_limit_then_urgent_market(self):
+        choice = self.selection(tick=r.FLATTEN_TICK)
+        self.assertFalse(choice["passive"])
+        self.assertIsNotNone(choice["price"])
+        api = MirroredExchange()
+        state = r.unwind_schedule(api, 71000, False)
+        choice = r.choose_unwind_order(api, {}, False, 71000, r.URGENT_TICK, state)
+        self.assertIsNone(choice["price"])
+        self.assertEqual(choice["quantity"], r.MAX_ORDER)
+
+    def test_time_needed_to_flatten_prevents_late_passive_orders(self):
+        self.assertFalse(self.selection(tick=250)["passive"])
+
+    def test_recovery_keeps_passive_attempt_budget(self):
+        api = MirroredExchange()
+        state = r.unwind_schedule(api, 71000, False)
+        state["misses"] = 2
+        self.assertIs(r.unwind_schedule(api, 60000, False), state)
+        self.assertEqual(api.unwind_schedule["misses"], 2)
+        self.assertIsNot(r.unwind_schedule(api, 60000, True), state)
+
+    def test_unfilled_passive_orders_cancel_before_active_closeout(self):
+        class NoPassiveFill(MirroredExchange):
+            def request(self, method, path, params=None):
+                if method == "POST" and path == "/orders":
+                    if self.get("/orders"):
+                        raise AssertionError(
+                            "Replacement submitted before cancellation"
+                        )
+                    passive = params["type"] == "LIMIT" and (
+                        params["price"] < 20
+                        if params["action"] == "BUY"
+                        else params["price"] > 19.98
+                    )
+                    if passive:
+                        self.writes.append((method, path, params))
+                        oid = len(self.orders) + 1
+                        self.orders[oid] = dict(
+                            order_id=oid,
+                            ticker=params["ticker"],
+                            quantity=params["quantity"],
+                            quantity_filled=0,
+                            status="OPEN",
+                        )
+                        return {"order_id": oid}
+                return super().request(method, path, params)
+
+        for action in ["BUY", "SELL"]:
+            with self.subTest(action=action):
+                api = NoPassiveFill(action=action)
+                logs = InventoryRegressionTests().run_exchange(api)
+                cancels = [o for o in api.orders.values() if o["status"] == "CANCELLED"]
+                self.assertEqual(len(cancels), 2)
+                self.assertEqual(
+                    sum(o["quantity_filled"] for o in api.orders.values()), 71000
+                )
+                self.assertEqual(api.position, 0)
+                self.assertFalse(api.get("/orders"))
+                styles = [
+                    c.kwargs for c in logs.call_args_list if c.args[0] == "unwind_order"
+                ]
+                self.assertEqual([s["wait_seconds"] for s in styles[:2]], [1, 1])
+                self.assertEqual(styles[2]["execution_style"], "marketable_limit")
+
+
 class LoggingTests(unittest.TestCase):
     def test_console_and_file_share_one_serialized_event(self):
         with (
