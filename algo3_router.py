@@ -32,6 +32,7 @@ PASSIVE_MAX_MISSES = 2
 PASSIVE_TARGET_FRACTION = 0.40
 PASSIVE_CHILD_SIZE = 10_000
 PASSIVE_ADVERSE_MOVE = 0.02
+EARLY_PROFIT_RETENTION = 0.60
 RECHECK_SECS = 1.0
 POLL_SECS = 0.2
 BOOK_SAMPLE_SECONDS = 0.5
@@ -772,6 +773,45 @@ def stable_positions(api, seconds=3):
     raise RuntimeError(f"Position snapshot did not stabilize: {last}")
 
 
+def update_exit_value(api, books, remaining, tick):
+    """Mark the residual at the current executable book, not last-trade P&L."""
+    plan = getattr(api, "hedge_plan", None)
+    if not plan or plan.get("profit_bound") is None:
+        return None
+    buying = plan["action"] == "SELL"
+    filled, value, route = walk(aggregate(books, buying), remaining, buying)
+    projected = None
+    if filled == remaining:
+        projected = plan["profit_bound"] + (
+            remaining * plan["entry_price"] - value
+            if buying
+            else value - remaining * plan["entry_price"]
+        )
+        plan["peak_exit_estimate"] = max(plan.get("peak_exit_estimate", 0), projected)
+    plan["current_exit_estimate"] = projected
+    start = plan.get("start_tick", tick)
+    duration = max(1, plan["soft_deadline"] - start)
+    progress = max(0.0, min(1.0, (tick - start) / duration))
+    retention = EARLY_PROFIT_RETENTION * (1 - progress) + 0.10 * progress
+    plan["active_profit_target"] = max(
+        plan["keep_profit"], max(0, plan.get("peak_exit_estimate", 0)) * retention
+    )
+    log(
+        "exit_valuation",
+        tick=tick,
+        tender_id=plan["tender_id"],
+        remaining=remaining,
+        displayed_coverage=filled,
+        projected_net_bound=projected,
+        peak_exit_estimate=plan.get("peak_exit_estimate", 0),
+        active_profit_target=plan["active_profit_target"],
+        last_displayed_price=route[-1][2] if route else None,
+        book=book_summary(books),
+        actual_fill_prices_available=False,
+    )
+    return projected
+
+
 def begin_hedge_plan(
     api,
     tender,
@@ -795,6 +835,8 @@ def begin_hedge_plan(
         quantity=int(tender["quantity"]),
         profit_bound=0.0,
         estimated_entry_edge=edge,
+        start_tick=tick,
+        peak_exit_estimate=0.0,
         execution_model=details.get("execution_model"),
         keep_profit=max(1.0, max(0.0, edge or 0) * 0.10),
         soft_deadline=min(
@@ -815,6 +857,7 @@ def begin_hedge_plan(
         source=source,
     )
     api.hedge_plan = plan
+    update_exit_value(api, books, int(tender["quantity"]), tick)
     log("hedge_plan", **plan)
     return plan
 
@@ -852,8 +895,25 @@ def protect_exit(api, books, buying, remaining, tick, ticker, price, rest_second
             "Inventory direction changed; tender price attribution invalid"
         )
 
+    # Reserve time for active execution; a stale profit target cannot consume
+    # the entire hedge window or push all residual shares into the hard deadline.
+    active_seconds = (
+        math.ceil(remaining / CHILD_SIZE) * max(0.2, getattr(api, "child_seconds", 0.6))
+        + 2
+    )
+    if "start_tick" in plan and tick + active_seconds >= plan["soft_deadline"]:
+        log(
+            "profit_target_released",
+            tick=tick,
+            reason="active_execution_time_reserved",
+            target=plan.get("active_profit_target", plan["keep_profit"]),
+        )
+        return ticker, price, rest_seconds
+
     def bound(venue):
-        allowance = (plan["profit_bound"] - plan["keep_profit"]) / max(1, remaining)
+        allowance = (
+            plan["profit_bound"] - plan.get("active_profit_target", plan["keep_profit"])
+        ) / max(1, remaining)
         return (
             plan["entry_price"] - TAKE_FEE[venue] + allowance
             if buying
@@ -991,6 +1051,37 @@ def choose_unwind_order(api, books, buying, remaining, tick, schedule):
     quote = (
         passive_exit_quote(books, buying, remaining, target_left) if can_wait else None
     )
+    wait_cost = 0.0
+    advantage = 0.0
+    if quote:
+        quote_venue, quote_price, _ = quote
+        active_price, _, active_venue = levels[0]
+        advantage = (
+            (active_price + TAKE_FEE[active_venue])
+            - (quote_price + TAKE_FEE[quote_venue])
+            if buying
+            else (quote_price - TAKE_FEE[quote_venue])
+            - (active_price - TAKE_FEE[active_venue])
+        )
+        estimator = getattr(api, "liquidity", None)
+        if estimator:
+            profile = estimator.profile(buying, PASSIVE_SECONDS)
+            wait_cost = PASSIVE_SECONDS * max(
+                profile.get("adverse_per_second", 0),
+                0.5 * profile.get("price_noise_per_second", 0),
+            )
+        # A favorable movement of two cents is an opportunity to lock an exit.
+        favorable = (
+            (
+                schedule["midpoint"] - midpoint
+                if buying
+                else midpoint - schedule["midpoint"]
+            )
+            if bid and ask and bid[0][0] < ask[0][0]
+            else 0
+        )
+        if advantage <= wait_cost or favorable >= PASSIVE_ADVERSE_MOVE - 1e-9:
+            quote = None
     if quote:
         ticker, price, qty = quote
         return dict(
@@ -1000,6 +1091,8 @@ def choose_unwind_order(api, books, buying, remaining, tick, schedule):
             rest=PASSIVE_SECONDS,
             passive=True,
             reason="bounded_passive_phase",
+            passive_price_advantage=advantage,
+            observed_wait_cost=wait_cost,
         )
     price, available, ticker = levels[0]
     reason = (
@@ -1051,6 +1144,7 @@ def cover(api, before, after, liquidating=False):
         tick = int(case["tick"])
         urgent = tick >= URGENT_TICK
         force = tick >= FLATTEN_TICK
+        update_exit_value(api, books, abs(delta), tick)
         selection = choose_unwind_order(api, books, buying, abs(delta), tick, schedule)
         if selection is None:
             time.sleep(POLL_SECS)
@@ -1083,6 +1177,8 @@ def cover(api, before, after, liquidating=False):
             reason=selection["reason"],
             passive_attempts=schedule["attempts"],
             passive_filled=schedule["passive_filled"],
+            passive_price_advantage=selection.get("passive_price_advantage"),
+            observed_wait_cost=selection.get("observed_wait_cost"),
         )
         # Every order must strictly reduce actual shared exposure, including recovery.
         change = qty if buying else -qty

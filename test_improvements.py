@@ -105,3 +105,79 @@ class PatientAdmissionTests(unittest.TestCase):
             tender, books(quantity=1000), self.profile(near_refill_capacity=1000000)
         )
         self.assertEqual(details["execution_model"], "sweep")
+
+
+class ExitValueTests(unittest.TestCase):
+    def api(self, action="BUY"):
+        api = r.API(False)
+        api.hedge_plan = dict(
+            tender_id=1,
+            source="test",
+            action=action,
+            entry_price=9.8 if action == "BUY" else 10.2,
+            profit_bound=0,
+            keep_profit=1,
+            start_tick=100,
+            soft_deadline=130,
+        )
+        return api
+
+    def test_executable_profit_target_fades_without_ignoring_prices(self):
+        api = self.api()
+        with patch.object(r, "log"):
+            initial = r.update_exit_value(api, books(), 10000, 100)
+            target = api.hedge_plan["active_profit_target"]
+            self.assertAlmostEqual(target, initial * r.EARLY_PROFIT_RETENTION)
+            r.update_exit_value(api, books(bid=9.95, ask=9.97), 10000, 115)
+        self.assertLess(api.hedge_plan["active_profit_target"], target)
+        self.assertEqual(api.hedge_plan["peak_exit_estimate"], initial)
+
+    def test_insufficient_depth_does_not_claim_full_position_executable_pnl(self):
+        api = self.api()
+        with patch.object(r, "log"):
+            self.assertIsNone(r.update_exit_value(api, books(quantity=100), 10000, 100))
+        self.assertEqual(api.hedge_plan["active_profit_target"], 1)
+
+    def test_guard_protects_more_than_bare_break_even_after_profit_deteriorates(self):
+        api = self.api()
+        with patch.object(r, "log"):
+            r.update_exit_value(api, books(), 10000, 100)
+            _, price, rest = r.protect_exit(
+                api, books(), False, 10000, 101, r.ALT, 9.85
+            )
+        self.assertGreater(price, 9.90)
+        self.assertGreater(rest, 0.1)
+
+    def test_guard_reserves_active_execution_time(self):
+        api = self.api()
+        with patch.object(r, "log"):
+            result = r.protect_exit(api, books(), False, 10000, 128, r.ALT, 9.85)
+        self.assertEqual(result, (r.ALT, 9.85, 0.1))
+
+    def test_short_profit_uses_ask_side_and_fees(self):
+        api = self.api(action="SELL")
+        with patch.object(r, "log"):
+            value = r.update_exit_value(api, books(), 10000, 100)
+        self.assertAlmostEqual(value, 10000 * (10.2 - 10.02 - 0.005))
+
+    def test_volatile_prices_can_make_passive_wait_uneconomic(self):
+        api = self.api()
+        api.hedge_plan = None
+        state = r.unwind_schedule(api, 10000, False)
+        with patch.object(
+            api.liquidity,
+            "profile",
+            return_value=dict(adverse_per_second=0.1, price_noise_per_second=0.1),
+        ):
+            choice = r.choose_unwind_order(api, books(), False, 10000, 100, state)
+        self.assertFalse(choice["passive"])
+
+    def test_favorable_price_move_locks_active_exit(self):
+        api = self.api()
+        api.hedge_plan = None
+        state = r.unwind_schedule(api, 10000, False)
+        r.choose_unwind_order(api, books(), False, 10000, 100, state)
+        choice = r.choose_unwind_order(
+            api, books(bid=10.02, ask=10.04), False, 10000, 101, state
+        )
+        self.assertFalse(choice["passive"])
