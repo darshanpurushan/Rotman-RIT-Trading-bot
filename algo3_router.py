@@ -1366,7 +1366,7 @@ def run(live=False, confirmed=False):
     waiting_log = -100.0
     log(
         "start",
-        version="14-passive-limit-unwind",
+        version="15-adaptive-price-aware-unwind",
         live=live,
         base_url=BASE_URL,
         position_mode="mirrored",
