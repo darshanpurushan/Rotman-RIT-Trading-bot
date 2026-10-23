@@ -34,6 +34,8 @@ PASSIVE_CHILD_SIZE = 10_000
 PASSIVE_ADVERSE_MOVE = 0.02
 RECHECK_SECS = 1.0
 POLL_SECS = 0.2
+BOOK_SAMPLE_SECONDS = 0.5
+NEAR_PRICE_BAND = 0.03
 LOG = Path("algo3_events.jsonl")
 
 
@@ -115,6 +117,7 @@ class API:
             for t in MARKETS
         }
         self.liquidity.observe(books)
+        self.last_book_observation = time.monotonic()
         return books
 
 
@@ -251,6 +254,62 @@ class LiquidityEstimator:
         if requested > 0:
             self.fill_ratio = 0.7 * self.fill_ratio + 0.3 * min(1, filled / requested)
 
+    def near_price_profile(self, buying, horizon):
+        h = self.history
+        elapsed = h[-1][0] - h[0][0] if len(h) > 1 else 0
+        if len(h) < 4 or elapsed < 3 or time.monotonic() - h[-1][0] > 2:
+            return dict(
+                near_refill_capacity=0,
+                near_price_band=NEAR_PRICE_BAND,
+                adverse_per_second=0.0,
+                price_noise_per_second=0.0,
+            )
+        references = []
+        for _, snapshot in h:
+            # Use the marginal price for 1,000 shares to avoid one-share quotes
+            # dominating the price movement estimate. Routing still honors NBBO.
+            levels = sorted(
+                snapshot[buying].items(),
+                key=lambda item: item[0][0],
+                reverse=not buying,
+            )
+            cumulative = 0
+            for (price, _), quantity in levels:
+                cumulative += quantity
+                if cumulative >= 1000:
+                    references.append(price)
+                    break
+            else:
+                if levels:
+                    references.append(levels[-1][0][0])
+        if not references:
+            return dict(
+                near_refill_capacity=0,
+                near_price_band=NEAR_PRICE_BAND,
+                adverse_per_second=0.0,
+                price_noise_per_second=0.0,
+            )
+        reference = references[-1]
+
+        def near(price):
+            return abs(price - reference) <= NEAR_PRICE_BAND + 1e-9
+
+        additions = 0
+        for (_, a), (_, b) in zip(h, h[1:]):
+            old, new = a[buying], b[buying]
+            additions += sum(
+                max(0, new[k] - old[k]) for k in old.keys() & new.keys() if near(k[0])
+            )
+        movement = (references[-1] - references[0]) * (1 if buying else -1)
+        return dict(
+            near_refill_capacity=int(
+                0.25 * additions / elapsed * min(8, max(0, horizon))
+            ),
+            near_price_band=NEAR_PRICE_BAND,
+            adverse_per_second=max(0.0, movement / elapsed),
+            price_noise_per_second=(max(references) - min(references)) / elapsed,
+        )
+
     def profile(self, buying, horizon):
         now = time.monotonic()
         h = self.history
@@ -287,6 +346,7 @@ class LiquidityEstimator:
             persistence=persistence,
             fill_ratio=self.fill_ratio,
             history_samples=len(h),
+            **self.near_price_profile(buying, horizon),
         )
 
 
@@ -1179,6 +1239,13 @@ def run(live=False, confirmed=False):
                     )
                 time.sleep(0.2)
                 continue
+            # Keep learning while flat, including the gaps between tenders.
+            if (
+                time.monotonic() - getattr(api, "last_book_observation", -100)
+                >= BOOK_SAMPLE_SECONDS
+            ):
+                api.books()
+                api.last_book_observation = time.monotonic()
             if time.monotonic() - heartbeat > 5:
                 heartbeat = time.monotonic()
                 log("heartbeat", tick=tick, positions=p)
