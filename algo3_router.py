@@ -21,7 +21,8 @@ CHILD_SIZE = 5_000
 NET_LIMIT, GROSS_LIMIT = 100_000, 200_000  # Actual performance report configuration.
 MIN_PROFIT = 1.0
 CASE_END = 300
-NO_NEW_TENDERS_TICK = 260
+LATE_TENDER_TICK = 240
+NO_NEW_TENDERS_TICK = 275
 FLATTEN_TICK = 260
 URGENT_TICK = 275
 FLAT_TARGET_TICK = 285  # Reserve 15 seconds for cancellations/reconciliation.
@@ -220,6 +221,73 @@ def execution_budget(qty, child_seconds=0.6):
         + PASSIVE_TOTAL_SECONDS
         + 5,
     )
+
+
+def tender_execution_budget(t, books, tick, child_seconds=0.6):
+    qty = int(t["quantity"])
+    if tick < LATE_TENDER_TICK:
+        return execution_budget(qty, child_seconds)
+    # Late hedges rely on active execution. Count price/venue fragments too;
+    # a thin multi-level book may require more children than qty / CHILD_SIZE.
+    filled, _, route = walk(
+        aggregate(books, t["action"] == "SELL"), qty, t["action"] == "SELL"
+    )
+    children = sum(math.ceil(q / CHILD_SIZE) for _, q, _ in route)
+    children += math.ceil((qty - filled) / CHILD_SIZE)
+    return max(8.0, children * max(0.6, child_seconds) * 1.25 + 4.0)
+
+
+def admission_speed(api, tick):
+    if tick >= LATE_TENDER_TICK:
+        # Include book/case reads and reconciliation; passive waiting is not
+        # extrapolated into a hedge that will use active limits throughout.
+        return max(0.6, api.child_seconds + 3 * api.latency, 10 * api.latency + 0.4)
+    return max(
+        api.child_seconds,
+        6 * api.latency,
+        CHILD_SIZE * getattr(api, "hedge_seconds_per_share", 0),
+    )
+
+
+def estimate_tender(t, books, profile, tick, child_seconds=0.6):
+    if tick < LATE_TENDER_TICK:
+        return estimate_unwind(t, books, profile)
+    qty = int(t["quantity"])
+    buying = t["action"] == "SELL"
+    levels = aggregate(books, buying, profile["depth_fraction"])
+    filled, value, _ = walk(levels, qty, buying)
+    budget = tender_execution_budget(t, books, tick, child_seconds)
+    details = dict(
+        profile,
+        execution_model="late_displayed_depth",
+        visible_shares=filled,
+        unobserved_shares=qty - filled,
+        credited_refill_shares=0,
+        late_round=True,
+        execution_budget=budget,
+        seconds_to_flat_target=FLAT_TARGET_TICK - tick,
+    )
+    if filled != qty:
+        return None, details
+    # Full discounted displayed coverage is required; replenishment is not
+    # credited late. Stress the whole block, in addition to exchange fees.
+    stress = max(
+        0.02, profile["tail_stress"], profile.get("adverse_per_second", 0) * budget
+    )
+    uncertainty = qty * max(0.0025, stress * 0.10)
+    edge = (
+        (qty * float(t["price"]) - value if buying else value - qty * float(t["price"]))
+        - qty * stress
+        - uncertainty
+    )
+    details.update(
+        estimated_hedge_value=value,
+        late_price_stress=stress,
+        stress_cost=qty * stress,
+        uncertainty_cost=uncertainty,
+        estimated_net_edge=edge,
+    )
+    return edge, details
 
 
 def submission_ready(t, tick, latency):
@@ -466,8 +534,10 @@ def estimate_unwind(t, books, profile):
 
 
 def should_accept(t, books, pos, tick, child_seconds=0.6, profile=None):
-    if tick >= NO_NEW_TENDERS_TICK or FLAT_TARGET_TICK - tick < execution_budget(
-        int(t["quantity"]), child_seconds
+    if (
+        tick >= NO_NEW_TENDERS_TICK
+        or FLAT_TARGET_TICK - tick
+        < tender_execution_budget(t, books, tick, child_seconds)
     ):
         return False, "insufficient execution time remaining", None
     if position_value(pos) != 0 or not within_limits(pos):
@@ -489,8 +559,14 @@ def should_accept(t, books, pos, tick, child_seconds=0.6, profile=None):
         profile = LiquidityEstimator().profile(
             buying, execution_budget(qty, child_seconds)
         )
-    profit, details = estimate_unwind(t, books, profile)
+    profit, details = estimate_tender(t, books, profile, tick, child_seconds)
     if profit is None:
+        if tick >= LATE_TENDER_TICK:
+            return (
+                False,
+                "late tender requires full discounted displayed hedge depth",
+                None,
+            )
         return False, "insufficient adaptive depth and observed replenishment", None
     return (
         profit >= MIN_PROFIT,
@@ -872,7 +948,9 @@ def begin_hedge_plan(
     profile = profile or (
         getattr(api, "liquidity", None) or LiquidityEstimator()
     ).profile(buying, 8)
-    edge, details = estimate_unwind(tender, books, profile)
+    edge, details = estimate_tender(
+        tender, books, profile, tick, admission_speed(api, tick)
+    )
     if estimated_edge is not None:
         edge = estimated_edge
     plan = dict(
@@ -883,6 +961,7 @@ def begin_hedge_plan(
         profit_bound=0.0,
         estimated_entry_edge=edge,
         start_tick=tick,
+        late_round=tick >= LATE_TENDER_TICK,
         peak_exit_estimate=0.0,
         execution_model=details.get("execution_model"),
         keep_profit=max(1.0, max(0.0, edge or 0) * 0.10),
@@ -903,6 +982,8 @@ def begin_hedge_plan(
         ),
         source=source,
     )
+    if plan["late_round"]:
+        plan["soft_deadline"] = FLAT_TARGET_TICK
     api.hedge_plan = plan
     update_exit_value(api, books, int(tender["quantity"]), tick)
     log("hedge_plan", **plan)
@@ -935,7 +1016,12 @@ def credit_hedge_fill(api, ticker, action, filled, price):
 
 def protect_exit(api, books, buying, remaining, tick, ticker, price, rest_seconds=0.1):
     plan = getattr(api, "hedge_plan", None)
-    if not plan or plan["profit_bound"] is None or tick >= plan["soft_deadline"]:
+    if (
+        not plan
+        or plan["profit_bound"] is None
+        or tick >= plan["soft_deadline"]
+        or plan.get("late_round")
+    ):
         return ticker, price, rest_seconds
     if buying != (plan["action"] == "SELL"):
         raise RuntimeError(
@@ -1112,6 +1198,7 @@ def choose_unwind_order(api, books, buying, remaining, tick, schedule):
     plan = getattr(api, "hedge_plan", None)
     can_wait = (
         tick < FLATTEN_TICK
+        and not (plan and plan.get("late_round"))
         and FLATTEN_TICK - tick > time_needed + PASSIVE_SECONDS + 2
         and elapsed + PASSIVE_SECONDS <= PASSIVE_TOTAL_SECONDS
         and schedule["attempts"] < PASSIVE_MAX_ATTEMPTS
@@ -1366,11 +1453,12 @@ def run(live=False, confirmed=False):
     waiting_log = -100.0
     log(
         "start",
-        version="15-adaptive-price-aware-unwind",
+        version="16-late-tender-aware-unwind",
         live=live,
         base_url=BASE_URL,
         position_mode="mirrored",
         no_new_tenders_tick=NO_NEW_TENDERS_TICK,
+        late_tender_checks_tick=LATE_TENDER_TICK,
         flatten_tick=FLATTEN_TICK,
         urgent_tick=URGENT_TICK,
         flat_target_tick=FLAT_TARGET_TICK,
@@ -1413,7 +1501,10 @@ def run(live=False, confirmed=False):
             cache.update({int(t["tender_id"]): dict(t) for t in tenders})
             api.tender_cache = cache
             if live and (
-                recovery or tick >= FLATTEN_TICK or any(p.values()) or thor_orders
+                recovery
+                or tick >= NO_NEW_TENDERS_TICK
+                or any(p.values())
+                or thor_orders
             ):
                 if any(p.values()) and not getattr(api, "hedge_plan", None):
                     matched = matching_manual_tender(api, position_value(p), tick)
@@ -1503,11 +1594,7 @@ def run(live=False, confirmed=False):
                 tick = int(fresh_case["tick"])
                 if fresh_case["status"] != "ACTIVE":
                     return
-                speed = max(
-                    api.child_seconds,
-                    6 * api.latency,
-                    CHILD_SIZE * getattr(api, "hedge_seconds_per_share", 0),
-                )
+                speed = admission_speed(api, tick)
                 estimator = getattr(api, "liquidity", None)
                 profile = (estimator or LiquidityEstimator()).profile(
                     t.get("action") == "SELL",
@@ -1525,7 +1612,7 @@ def run(live=False, confirmed=False):
                     )
                 ok, reason, edge = should_accept(t, books, before, tick, speed, profile)
                 _, estimate_details = (
-                    estimate_unwind(t, books, profile)
+                    estimate_tender(t, books, profile, tick, speed)
                     if t.get("price") is not None
                     and t.get("action") in ("BUY", "SELL")
                     and int(t["quantity"]) > 0
@@ -1549,7 +1636,8 @@ def run(live=False, confirmed=False):
                         displayed_fraction=profile["depth_fraction"],
                         liquidity_estimate=estimate_details,
                         book=book_summary(books),
-                        execution_budget=execution_budget(int(t["quantity"]), speed),
+                        execution_budget=tender_execution_budget(t, books, tick, speed),
+                        late_round=tick >= LATE_TENDER_TICK,
                         tender_seconds_remaining=remaining,
                         profitable_and_eligible=profitable_and_eligible,
                         usable_hedge_depth=sum(
@@ -1563,6 +1651,50 @@ def run(live=False, confirmed=False):
                     )
                     last_log[tid] = (*signature, now)
                 if not live or not ok:
+                    continue
+                # Recheck admission after API reads, before creating a pending
+                # write. Crossing into the late window invokes the strict model.
+                preflight_case = api.get("/case")
+                if preflight_case["status"] != "ACTIVE":
+                    return
+                if int(preflight_case["tick"]) >= LATE_TENDER_TICK:
+                    books = api.books()
+                fresh_before = api.positions()
+                open_now = api.get("/orders", {"status": "OPEN"})
+                preflight_case = api.get("/case")
+                tick = int(preflight_case["tick"])
+                if preflight_case["status"] != "ACTIVE":
+                    return
+                speed = admission_speed(api, tick)
+                prior_capacity = profile.get("recent_execution_capacity", 0)
+                profile = (
+                    getattr(api, "liquidity", None) or LiquidityEstimator()
+                ).profile(
+                    t["action"] == "SELL",
+                    tender_execution_budget(t, books, tick, speed),
+                )
+                if tick < LATE_TENDER_TICK:
+                    profile["recent_execution_capacity"] = prior_capacity
+                eligible, preflight_reason, edge = should_accept(
+                    t, books, fresh_before, tick, speed, profile
+                )
+                ready, _ = submission_ready(t, tick, api.latency)
+                if (
+                    not eligible
+                    or not ready
+                    or fresh_before != before
+                    or any(o.get("ticker") in MARKETS for o in open_now)
+                ):
+                    log(
+                        "tender_preflight_blocked",
+                        tender_id=tid,
+                        tick=tick,
+                        reason=(
+                            preflight_reason
+                            if not eligible
+                            else "expiry or account state changed"
+                        ),
+                    )
                     continue
                 seen.add(tid)
                 change = int(t["quantity"]) * (1 if t["action"] == "BUY" else -1)

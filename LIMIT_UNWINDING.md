@@ -1,4 +1,4 @@
-# ALGO3 price-aware unwinding (v15)
+# ALGO3 price-aware unwinding (v16)
 
 The router evaluates fixed-price tenders and hedges the resulting shared THOR inventory across THOR_M and THOR_A. A marketable limit order caps the execution price but can still cross the spread. Passive limits seek better prices while accepting fill risk.
 
@@ -13,6 +13,14 @@ Two estimates are compared:
 
 The better supported estimate is used, with both estimates and the chosen model logged. Estimated profit must remain positive, positions must be flat before a new tender, and exposure and execution-time checks must pass. Future liquidity remains uncertain. More participants do not automatically imply better liquidity.
 
+## Late tenders remain eligible
+
+The five offers belong to one 300-second round. Tender order or ID does not affect eligibility: the fifth offer can be accepted around tick 250–260. Remaining time changes execution requirements, rather than automatically disqualifying that offer.
+
+From tick 240, admission requires the entire hedge to fit within discounted displayed depth, positive fee-inclusive profit after price stress and uncertainty, and enough time to target flat inventory by tick 285. No future replenishment is credited. The time budget counts price/venue fragments and measured active execution latency. The case, books, positions, open orders, and expiry are checked again before acceptance.
+
+New late hedges use marketable limits immediately, without passive rests or waiting for a profit-retention target. Prices and depth are still refreshed for each child. New entries stop at tick 275, when urgent closeout begins. A smaller tender can therefore qualify later than a larger one. These checks reduce deadline risk but cannot guarantee fills or profitability.
+
 ## Exit pricing and pacing
 
 For an attributable tender, every child decision revalues the remaining inventory using executable depth on both venues and configured fees. If the displayed book cannot cover the residual, no complete-position executable P&L estimate is claimed. Previously confirmed limit fills contribute a conservative profit bound; submitted limit prices are not labeled as actual execution prices.
@@ -23,7 +31,7 @@ Passive execution is limited to 40% of the initial hedge, with 10,000-share chil
 
 Active children normally target 5,000 shares, rising toward 10,000 when the remaining time and measured active execution latency require it. Nearby levels on the same venue can be combined within one cent; the router stops before a better competing venue quote. It can still send a tiny order when honoring the best displayed price requires one.
 
-New tenders and the passive phase stop at tick 260. Urgent market children begin at tick 275, capped at 25,000 shares. The flat target is tick 285 before the 300-tick round ends. API outages or insufficient liquidity can still prevent completion.
+The passive phase stops at tick 260; eligible late tenders remain available until tick 275. Urgent market children begin at tick 275, capped at 25,000 shares. The flat target is tick 285 before the 300-tick round ends. API outages or insufficient liquidity can still prevent completion.
 
 ## Reconciliation and recovery
 
@@ -59,4 +67,4 @@ Startup reports `15-adaptive-price-aware-unwind`. No new runtime dependency is r
 & ".\.venv\Scripts\python.exe" .\audit_events.py .\algo3_events.jsonl
 ```
 
-The ALGO3 suite contains 118 offline tests covering admission, exposure limits, partial fills, cancellation races, uncertain writes, recovery, liquidity history, price protection, passive failure, active sizing, and closeout. These tests validate behavior, not profitability. Historical event logs without full book and actual-fill records cannot establish how this version would have performed in earlier rounds.
+The ALGO3 suite contains 130 offline tests covering admission, exposure limits, partial fills, cancellation races, uncertain writes, recovery, liquidity history, price protection, passive failure, active sizing, and closeout. These tests validate behavior, not profitability. Historical event logs without full book and actual-fill records cannot establish how this version would have performed in earlier rounds.

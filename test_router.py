@@ -410,7 +410,10 @@ class InventoryRegressionTests(unittest.TestCase):
         t = dict(ticker=r.MAIN, action="BUY", quantity=1000, price=19, expires=290)
         self.assertFalse(
             r.should_accept(
-                t, MirroredExchange().books(), dict.fromkeys(r.MARKETS, 0), 260
+                t,
+                MirroredExchange().books(),
+                dict.fromkeys(r.MARKETS, 0),
+                r.NO_NEW_TENDERS_TICK,
             )[0]
         )
 
