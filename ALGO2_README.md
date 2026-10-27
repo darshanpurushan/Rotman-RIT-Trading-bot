@@ -9,6 +9,33 @@ $env:RIT_API_KEY = "YOUR_RIT_API_KEY"
 
 The command and filename are unchanged. Keep your existing state file. The startup version is `2.0-publication-grace`. Launch before the simulation: it waits for ACTIVE, trades one round and exits when the case stops. Omit `--live --confirmed` for read-only observation, which updates quote history but does not simulate fills or P&L.
 
+## Execution walkthrough
+
+The market maker seeks spread income and passive-fill rebates while controlling the inventory left by uneven fills. It continuously observes the external book, computes inventory-adjusted bid and ask prices, and reconciles each order before replacement.
+
+| Stage | What the bot does |
+|---|---|
+| Observe | Exclude its own orders from the reference book and track midpoint changes |
+| Price | Adjust quote width for short-term variation and shift prices with inventory and trend |
+| Size | Reduce the side that increases exposure; stop increasing inventory at the soft limit |
+| Maintain | Preserve competitive quotes and pace cancellations and replacements |
+| Reconcile | Track partial fills and reserve uncertain submissions until resolved |
+| Finish | Allow only reducing quotes from tick 260; cancel and flatten from tick 275 |
+
+Under the configured case economics, a passive fill pays a $0.01 fee and earns a $0.015 rebate, a net $0.005 per share. Two passive legs can add $0.01 per share to the captured spread before adverse movement and any liquidation costs. Both legs filling is not guaranteed.
+
+### Code map
+
+| Function | Responsibility |
+|---|---|
+| `quotes` | Inventory, trend, and volatility adjustments to prices and sizes |
+| `capacity` | Worst-case exposure if all outstanding buys or sells fill |
+| `Bot.step` | Quote maintenance and end-of-round execution |
+| `Bot.submit` | Fresh state checks and reservation before submission |
+| `Bot.reconcile` / `Bot.order_status` | Partial fills, publication delays, and uncertain execution |
+| `Bot.save` | Atomic persistence for restart protection |
+| `API.call` | Request handling and write-rate pacing |
+
 ## Strategy
 
 Quote both sides of ALGO, normally up to 4,000 shares each. Improve the displayed price by one cent when the spread permits; check the opposite touch before sending to avoid intentionally crossing it. Adapt quote prices and sizes to midpoint movement, volatility and inventory. Stop adding to a position at 12,000 shares and operate below a 20,000-share cap, leaving a buffer beneath the case's 25,000-share limit.
@@ -53,3 +80,4 @@ State is saved to `algo2_state.json` before POST, using flush/fsync and atomic r
 ```
 
 44 offline tests cover partial fills, publication delays, reservations, side-specific replacement, transient read errors, lost POST responses, cancellation pacing, fees, state persistence and closeout. These tests do not establish live profitability or guarantee zero fines. The API does not offer atomic post-only checks here, and the price can move before order arrival. If execution status cannot be resolved or RIT becomes unavailable, inventory may require manual intervention.
+

@@ -47,6 +47,8 @@ The actual practice reports specify a 5,000-share order maximum, a $0.01/share f
 
 **Practice status:** v1.1 earned $429.28 and $383.00 in the supplied single-participant reports, both ending flat with no position-limit fines. Their logs exposed immediate cancellation after normal publication delays and an early shutdown after a read timeout. v2.0 adds a 1.5-second known-order publication grace, preserves competitive opposite quotes, paces cancellation retries and resumes after transient read errors. Unknown POST outcomes remain blocked. [Read the evidence and changes](ALGO2_PRACTICE_REVIEW.md). No live P&L improvement is claimed for v2.0 yet.
 
+The market maker follows an observe → price → size → reconcile loop, adjusting quotes for inventory, short-term price variation, and trend. Its [execution walkthrough and code map](ALGO2_README.md#execution-walkthrough) explain the quote engine and order lifecycle.
+
 ## ALGO3: Tender evaluation and smart order routing
 
 **Objective:** earn the difference between an institutional tender price and the cost of hedging its inventory across two exchanges, after fees and execution uncertainty.
