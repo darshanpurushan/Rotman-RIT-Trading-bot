@@ -1,6 +1,8 @@
 # Rotman RIT Trading Bots
 
-Python trading bots for two **Rotman Interactive Trader (RIT)** cases: market making in **ALGO2** and institutional tender execution in **ALGO3**. Both use the local RIT REST API, wait automatically for a case to start, and manage orders and inventory through a 300-tick round.
+Developed for **Columbia University's high-frequency trading course**, this project implements two Python strategies for **Rotman Interactive Trader (RIT)**: an inventory-aware market maker and a smart order router for institutional tenders.
+
+The project connects market microstructure decisions to execution: reading limit order books, estimating liquidity and trading costs, choosing prices and quantities, reconciling partial fills, and managing inventory against a fixed deadline. Both bots use the local RIT REST API, wait automatically for a case to start, and operate through a 300-tick round.
 
 ## Cases at a glance
 
@@ -11,9 +13,9 @@ Python trading bots for two **Rotman Interactive Trader (RIT)** cases: market ma
 | Market | One stock: `ALGO` | One underlying across `THOR_M` and `THOR_A` |
 | Inventory control | Quote prices and quantities respond to current exposure | Child orders reduce accepted tender inventory |
 | Execution | Maintain passive buy/sell quotes, with market orders for closeout | Route child orders across venues using price, depth and fees |
-| Current version | v2.0, `2.0-publication-grace` | v12, pending-order reservations |
-| Offline tests | 44 | 67 |
-| Detailed guide | [ALGO2 guide](ALGO2_README.md) | [ALGO3 strategy](ALGO3_README.md) and [operations](OPERATIONS.md) |
+| Current version | v2.0, `2.0-publication-grace` | v16, `16-late-tender-aware-unwind` |
+| Offline tests | 44 | 130 across strategy, execution, and event-audit tests |
+| Detailed guide | [ALGO2 guide](ALGO2_README.md) | [ALGO3 strategy](ALGO3_README.md) and [current unwind policy](LIMIT_UNWINDING.md) |
 
 ## Selected practice results
 
@@ -47,17 +49,27 @@ The actual practice reports specify a 5,000-share order maximum, a $0.01/share f
 
 ## ALGO3: Tender evaluation and smart order routing
 
-The tender engine evaluates institutional block trades using order books from both THOR venues. It estimates hedge proceeds or costs, fees, liquidity uncertainty and execution time before accepting an offer.
+**Objective:** earn the difference between an institutional tender price and the cost of hedging its inventory across two exchanges, after fees and execution uncertainty.
 
-- Discount displayed liquidity according to recent persistence and aggressive-order fill ratios.
-- Credit a capped portion of observed replenishment; stress prices for a limited unseen tail.
-- Require positive estimated net profit above a $1 numerical floor and pass inventory, timing and expiry checks.
-- Hedge through smaller child orders, prioritize favorable prices and use venue fees to break price ties.
-- Treat `THOR_M` and `THOR_A` position fields as mirrored underlying inventory; do not sum them as independent exposures.
-- Reserve unresolved submissions to prevent replacement trades against fills that have not yet appeared in inventory.
-- Stop accepting tenders at tick 260, increase closeout urgency at tick 275 and target flat inventory by tick 285.
+The router combines the `THOR_M` and `THOR_A` books and compares immediate execution with a patient alternative supported by recent replenishment near current prices. It accepts an eligible tender automatically, then manages the hedge one confirmed child order at a time.
 
-Independent directional and cross-venue entry experiments were removed from ALGO3 following case-fine evidence. They are not part of the current strategy. See the [detailed strategy and limitations](ALGO3_README.md) for the estimation model and reconciliation rules.
+| Stage | What the router does | Why it matters |
+|---|---|---|
+| Observe | Samples both books while idle and refreshes them for decisions | Builds liquidity history before an offer arrives |
+| Estimate | Discounts unstable depth, measures nearby replenishment, and includes fees and adverse-price allowances | Evaluates the economics of the whole tender quantity |
+| Admit | Requires positive modeled net profit and checks exposure, expiry, and hedge time | Avoids accepting a block solely because its price looks attractive |
+| Price the exit | Revalues residual inventory at executable depth and tracks a conservative profit target | Connects each exit decision to the tender's economics |
+| Execute | Weighs passive price improvement against recent movement; otherwise routes marketable limits by price and depth | Balances execution price with the cost of waiting |
+| Reconcile | Confirms fills, cancellations, and inventory before replacement | Prevents duplicate or overlapping hedge orders |
+| Recover and finish | Resumes tender evaluation after verified recovery; increases urgency near the deadline | Keeps a resolved error from disabling the rest of the round |
+
+**Price-aware unwinding.** The early profit target retains 60% of the highest observed complete-position executable exit estimate, fading toward 10% over a bounded hedge window. The router reserves time for active execution and releases the target when completion requires it. This is an execution objective, not a guaranteed profit floor.
+
+**Bounded passive limits.** Passive attempts target up to 40% of the hedge, with one-second rests, a six-second phase window, and limits on attempts and zero fills. Waiting ends sooner when price movement or remaining time makes it unattractive. Active children normally target 5,000 shares and can grow toward 10,000 under time pressure; nearby same-venue levels can be combined while respecting competing quotes.
+
+**Inventory and deadline discipline.** The two THOR position fields represent mirrored underlying inventory. Ordinary orders must reduce exposure and cannot cross zero. From tick 240, tenders require full discounted displayed hedge depth and stressed positive profit; new tenders stop at tick 275, urgent market children begin at 275, and flat inventory is targeted by 285. Independent speculative entries are disabled. Unresolved submissions remain reserved; ALGO3 reservations are process-local.
+
+Read the [strategy walkthrough](ALGO3_README.md) for the main functions and the [v16 execution policy](LIMIT_UNWINDING.md) for exact controls and limitations. Use [`audit_events.py`](audit_events.py) to summarize versions, decisions, bot acceptances, recoveries, and confirmed child volume from a log.
 
 ## Setup and execution
 
@@ -89,10 +101,10 @@ For ALGO2, Ctrl+C requests cancellation and flattening while the market is activ
 
 ```powershell
 & ".\.venv\Scripts\python.exe" -m unittest test_algo2
-& ".\.venv\Scripts\python.exe" -m unittest test_router
+& ".\.venv\Scripts\python.exe" -m unittest test_router test_improvements test_audit_events test_late_tenders
 ```
 
-ALGO2's 44 offline tests cover partial fills, position bounds, stale positions, order-status 404 fallbacks, lost responses, restart blocking, passive quote prices, configured quote-size bounds, midpoint sampling, state-write recovery and closeout sizing. ALGO3's 67 tests cover tender admission, liquidity heuristics, timing, cancellation and pending-order protection. Tests use controlled API behavior and do not establish live profitability or queue performance. The cleanup adds no new performance claim; quote sizes below 500 shares and dry-run midpoint sampling now follow the configured behavior, and unchanged ALGO2 state no longer triggers repeated disk writes.
+ALGO2's 44 offline tests cover partial fills, position bounds, order visibility, lost responses, persistent reservations, quote behavior, and closeout. ALGO3's 130 offline tests cover tender admission, liquidity estimates, price protection, partial fills, uncertain writes, recovery, order sizing, deadlines, and event auditing. Tests validate controlled execution behavior; they do not establish live profitability, queue performance, or a guaranteed flat finish.
 
 ### Code quality
 
@@ -100,15 +112,15 @@ Optional development checks use the repository's formatter and import/lint confi
 
 ```powershell
 & ".\.venv\Scripts\python.exe" -m pip install -r requirements-dev.txt
-& ".\.venv\Scripts\python.exe" -m black --check algo2_market_maker.py algo3_router.py test_algo2.py test_router.py
-& ".\.venv\Scripts\python.exe" -m ruff check algo2_market_maker.py algo3_router.py test_algo2.py test_router.py
+& ".\.venv\Scripts\python.exe" -m black --check algo2_market_maker.py algo3_router.py audit_events.py test_algo2.py test_router.py test_improvements.py test_audit_events.py
+& ".\.venv\Scripts\python.exe" -m ruff check algo2_market_maker.py algo3_router.py audit_events.py test_algo2.py test_router.py test_improvements.py test_audit_events.py
 ```
 
 ## Practical limitations
 
 - **Queue and price risk:** quotes may fill predominantly on one side during a trend. The price can move between a book check and order arrival, so an intended passive order can still take liquidity; the API does not provide atomic post-only protection here.
 - **Execution uncertainty:** missing terminal records or inconsistent position snapshots can block further orders, including liquidation. Neither bot can guarantee a flat position or zero fines when the API is unavailable or the case ends first.
-- **Recovery differs between cases:** ALGO2 persists order reservations to disk and refuses unresolved previous sessions at startup. ALGO3 v12 reservations are process-local; restarting does not resolve an outstanding order.
+- **Recovery differs between cases:** ALGO2 persists order reservations to disk and refuses unresolved previous sessions at startup. ALGO3 reservations are process-local; restarting does not resolve an outstanding order.
 - **Heuristic parameters:** quote skews, volatility windows, liquidity discounts and refill assumptions have not been calibrated on a large independent execution dataset. Participant count and changing depth can alter outcomes materially.
 - **Case configuration:** verify fees, limits, symbols, rate limits and round length against the active simulation. ALGO2 defaults to the five orders per second documented in the supplied reports and slows after explicit rate-limit rejection.
 - **Performance evidence:** the selected rankings are historical practice results. ALGO2's two supplied positive-P&L reports are single-participant runs on v1.1; no Sharpe ratio, expected return or latest-version improvement is inferred.
@@ -123,12 +135,15 @@ Optional development checks use the repository's formatter and import/lint confi
 | `requirements_algo2.txt` | ALGO2 standalone dependency list |
 | `algo3_router.py` | Standalone ALGO3 bot |
 | `ALGO3_README.md` | Detailed ALGO3 technical write-up |
-| `ALGO3_Strategy.ipynb` | ALGO3 notebook |
+| `ALGO3_Strategy.ipynb` | Earlier strategy notebook; the Python router is the current implementation |
 | `OPERATIONS.md` | ALGO3 operational notes |
-| `test_router.py` | ALGO3 offline tests |
+| `test_router.py`, `test_improvements.py`, `test_audit_events.py`, `test_late_tenders.py` | ALGO3 strategy, execution, and audit tests |
+| `LIMIT_UNWINDING.md` | Current ALGO3 price-aware execution policy |
+| `audit_events.py` | Summarize execution logs without inventing fill prices or P&L |
 | `requirements.txt` | Shared Python dependencies |
 | `CHANGELOG.md` | Case-specific development history |
 
 Educational simulation software for RIT. Raw execution logs, runtime state, API credentials and copyrighted case documents are excluded from version control.
+
 
 
