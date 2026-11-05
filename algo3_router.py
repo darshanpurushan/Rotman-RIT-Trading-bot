@@ -204,6 +204,15 @@ def validate_reducing_order(params, pos):
         or int(quantity) != quantity
     ):
         raise RuntimeError("Invalid reducing order quantity")
+    if params.get("type") == "LIMIT":
+        price = params.get("price")
+        if (
+            not isinstance(price, (int, float))
+            or isinstance(price, bool)
+            or not math.isfinite(price)
+            or price <= 0
+        ):
+            raise RuntimeError("Invalid limit order price")
     value = position_value(pos)
     action = params.get("action")
     if value == 0:
