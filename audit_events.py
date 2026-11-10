@@ -13,9 +13,11 @@ from pathlib import Path
 def summarize(rows):
     sessions = []
     current = None
+    confirmed_fills = {}
     for row in rows:
         event = row.get("event")
         if event == "start":
+            confirmed_fills = {}
             current = dict(
                 version=row.get("version", "unversioned"),
                 started=row.get("time"),
@@ -43,11 +45,24 @@ def summarize(rows):
             current["recovery_reasons"][row.get("reason", "unknown")] += 1
         elif event == "recovery_rearmed":
             current["rearmed"] += 1
-        elif event == "child":
-            current["children"] += 1
-            current["confirmed_child_volume"] += int(row.get("filled", 0))
-            current["zero_fill_children"] += row.get("filled", 0) == 0
-            current["tiny_children"] += 0 < row.get("requested", 0) <= 100
+        elif event in ("child", "pending_order_resolved"):
+            filled = int(row.get("filled", 0))
+            order_id = row.get("order_id")
+            if order_id is None:
+                # Legacy child records have no identity for deduplication.
+                if event == "child":
+                    current["confirmed_child_volume"] += filled
+            else:
+                # Recovery can be the only fill evidence, or precede a
+                # normal child record for the same confirmed total.
+                key = str(order_id)
+                previous = confirmed_fills.get(key, 0)
+                current["confirmed_child_volume"] += max(0, filled - previous)
+                confirmed_fills[key] = max(previous, filled)
+            if event == "child":
+                current["children"] += 1
+                current["zero_fill_children"] += row.get("filled", 0) == 0
+                current["tiny_children"] += 0 < row.get("requested", 0) <= 100
         elif event == "case_inactive":
             current["last_flat_check"] = row.get("last_active_flat_check")
     for session in sessions:
