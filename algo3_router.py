@@ -106,7 +106,18 @@ class API:
 
     def positions(self):
         rows = self.get("/securities")
-        found = {x["ticker"]: int(x["position"]) for x in rows}
+        found = {}
+        for row in rows:
+            ticker = row["ticker"]
+            if ticker not in MARKETS:
+                continue
+            value = row["position"]
+            if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                    or not math.isfinite(value) or int(value) != value):
+                raise RuntimeError(f"Invalid position value for {ticker}")
+            if ticker in found:
+                raise RuntimeError(f"Duplicate position rows for {ticker}")
+            found[ticker] = int(value)
         if not all(t in found for t in MARKETS):
             raise RuntimeError(
                 f"Expected {MARKETS}; found {list(found)}. Check ticker configuration."
