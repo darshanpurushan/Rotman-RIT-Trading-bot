@@ -138,6 +138,17 @@ def aggregate(books, buying, fraction=1.0):
     depth = {}
     for ticker, book in books.items():
         for row in book.get("asks" if buying else "bids", []):
+            price = row["price"]
+            quantity, filled = row["quantity"], row.get("quantity_filled", 0)
+            if (not isinstance(price, (int, float)) or isinstance(price, bool)
+                    or not math.isfinite(price) or price <= 0):
+                raise RuntimeError("Invalid executable book price")
+            for value in (quantity, filled):
+                if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                        or not math.isfinite(value) or value < 0 or int(value) != value):
+                    raise RuntimeError("Invalid executable book quantity")
+            if filled > quantity:
+                raise RuntimeError("Invalid filled book quantity")
             qty = int(row["quantity"]) - int(row.get("quantity_filled", 0))
             if qty > 0:
                 key = (float(row["price"]), ticker)
