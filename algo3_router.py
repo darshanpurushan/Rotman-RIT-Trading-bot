@@ -543,6 +543,25 @@ def estimate_unwind(t, books, profile):
 
 
 def should_accept(t, books, pos, tick, child_seconds=0.6, profile=None):
+    # Validate offer numbers before budgeting or computing tender profit.
+    # Non-finite prices must never manufacture an infinite modeled edge,
+    # and fractional quantities must not be silently truncated by int().
+    price = t.get("price")
+    if (
+        not isinstance(price, (int, float))
+        or isinstance(price, bool)
+        or not math.isfinite(price)
+        or price <= 0
+    ):
+        return False, "invalid tender price", None
+    quantity = t.get("quantity")
+    if (
+        not isinstance(quantity, (int, float))
+        or isinstance(quantity, bool)
+        or not 0 < quantity <= NET_LIMIT
+        or int(quantity) != quantity
+    ):
+        return False, "invalid tender quantity", None
     if (
         tick >= NO_NEW_TENDERS_TICK
         or FLAT_TARGET_TICK - tick
