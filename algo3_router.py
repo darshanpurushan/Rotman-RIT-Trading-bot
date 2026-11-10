@@ -106,7 +106,18 @@ class API:
 
     def positions(self):
         rows = self.get("/securities")
-        found = {x["ticker"]: int(x["position"]) for x in rows}
+        found = {}
+        for row in rows:
+            ticker = row["ticker"]
+            if ticker not in MARKETS:
+                continue
+            value = row["position"]
+            if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                    or not math.isfinite(value) or int(value) != value):
+                raise RuntimeError(f"Invalid position value for {ticker}")
+            if ticker in found:
+                raise RuntimeError(f"Duplicate position rows for {ticker}")
+            found[ticker] = int(value)
         if not all(t in found for t in MARKETS):
             raise RuntimeError(
                 f"Expected {MARKETS}; found {list(found)}. Check ticker configuration."
@@ -127,6 +138,17 @@ def aggregate(books, buying, fraction=1.0):
     depth = {}
     for ticker, book in books.items():
         for row in book.get("asks" if buying else "bids", []):
+            price = row["price"]
+            quantity, filled = row["quantity"], row.get("quantity_filled", 0)
+            if (not isinstance(price, (int, float)) or isinstance(price, bool)
+                    or not math.isfinite(price) or price <= 0):
+                raise RuntimeError("Invalid executable book price")
+            for value in (quantity, filled):
+                if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                        or not math.isfinite(value) or value < 0 or int(value) != value):
+                    raise RuntimeError("Invalid executable book quantity")
+            if filled > quantity:
+                raise RuntimeError("Invalid filled book quantity")
             qty = int(row["quantity"]) - int(row.get("quantity_filled", 0))
             if qty > 0:
                 key = (float(row["price"]), ticker)
