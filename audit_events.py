@@ -6,6 +6,7 @@ Keep the input and generated output private unless you intend to share them.
 
 import argparse
 import json
+import math
 from collections import Counter
 from pathlib import Path
 
@@ -46,7 +47,13 @@ def summarize(rows):
         elif event == "recovery_rearmed":
             current["rearmed"] += 1
         elif event in ("child", "pending_order_resolved"):
-            filled = int(row.get("filled", 0))
+            filled = row.get("filled", 0)
+            if (isinstance(filled, bool) or not isinstance(filled, (int, float))
+                    or filled < 0
+                    or (isinstance(filled, float)
+                        and (not math.isfinite(filled) or not filled.is_integer()))):
+                raise ValueError("filled must be a finite nonnegative integer quantity")
+            filled = int(filled)
             order_id = row.get("order_id")
             if order_id is None:
                 # Legacy child records have no identity for deduplication.
