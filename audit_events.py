@@ -84,9 +84,12 @@ def read_events(path):
             if not line.strip():
                 continue
             try:
-                yield json.loads(line)
+                row = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"Invalid JSON on line {number}") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"Expected a JSON object on line {number}")
+            yield row
 
 
 if __name__ == "__main__":
