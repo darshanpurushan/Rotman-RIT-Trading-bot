@@ -173,10 +173,10 @@ class Tests(unittest.TestCase):
         self.assertNotIn("BUY", quotes(book(), 12000, [], Config(), 50))
 
     def test_late_flat_no_entry(self):
-        self.assertEqual(quotes(book(), 0, [], Config(), 260), {})
+        self.assertEqual(quotes(book(), 0, [], Config(), 290), {})
 
     def test_late_reduces_only(self):
-        q = quotes(book(), 100, [], Config(), 260)
+        q = quotes(book(), 100, [], Config(), 290)
         self.assertEqual(set(q), {"SELL"})
         self.assertEqual(q["SELL"][1], 100)
 
@@ -223,15 +223,15 @@ class Tests(unittest.TestCase):
     def test_closeout_small_remainder(self):
         self.api.position = 100
         self.bot.expected = 100
-        self.api.tick = 280
-        self.bot.step(280)
+        self.api.tick = 295
+        self.bot.step(295)
         self.assertEqual(self.api.posts[-1]["quantity"], 100)
         self.assertEqual(self.api.posts[-1]["action"], "SELL")
 
     def test_pending_closeout_not_duplicated(self):
         self.api.position = 100
         self.bot.expected = 100
-        self.api.tick = 280
+        self.api.tick = 295
         self.bot.submit("SELL", 100)
         self.bot.submit("SELL", 100)
         self.assertEqual(len(self.api.posts), 1)
@@ -407,6 +407,7 @@ class Tests(unittest.TestCase):
         later = {"status": "ACTIVE", "tick": 51}
         stopped = {"status": "STOPPED", "tick": 300}
         self.bot.started = True
+        self.bot.c.repeat = False
         with (
             patch.object(
                 self.api,
@@ -492,8 +493,8 @@ class Tests(unittest.TestCase):
             self.api,
             "case",
             side_effect=[
-                {"status": "ACTIVE", "tick": 259},
-                {"status": "ACTIVE", "tick": 260},
+                {"status": "ACTIVE", "tick": 289},
+                {"status": "ACTIVE", "tick": 290},
             ],
         ):
             self.bot.submit("BUY", 4000, 10)
@@ -515,15 +516,15 @@ class Tests(unittest.TestCase):
 
     def test_closeout_uses_exact_residual_and_ends_flat(self):
         self.bot.expected = self.api.position = 10000
-        self.api.tick = 280
+        self.api.tick = 295
         for residual in (6000, 2000, 0):
-            self.bot.step(280)
+            self.bot.step(295)
             oid = max(self.api.rows)
             self.api.rows[oid].update(
                 status="TRANSACTED", quantity_filled=self.api.rows[oid]["quantity"]
             )
             self.api.position = residual
-        self.bot.step(281)
+        self.bot.step(296)
         self.assertEqual([o["quantity"] for o in self.api.posts], [4000, 4000, 2000])
         self.assertEqual(self.bot.expected, 0)
         self.assertFalse(self.bot.records)
