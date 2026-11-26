@@ -15,7 +15,7 @@ The project connects market microstructure decisions to execution: reading limit
 | Execution | Maintain passive buy/sell quotes, with market orders for closeout | Route child orders across venues using price, depth and fees |
 | Current version | v2.0, `2.0-publication-grace` | v16, `16-late-tender-aware-unwind` |
 | Offline tests | 44 | 130 across strategy, execution, and event-audit tests |
-| Detailed guide | [ALGO2 guide](ALGO2_README.md) | [ALGO3 strategy](ALGO3_README.md) and [current unwind policy](LIMIT_UNWINDING.md) |
+| Detailed guide | [ALGO2 guide](ALGO2_README.md) · [Changelog](ALGO2_CHANGELOG.md) | [ALGO3 strategy](ALGO3_README.md) and [current unwind policy](LIMIT_UNWINDING.md) |
 
 ## Selected practice results
 
@@ -45,7 +45,7 @@ The market maker aims to earn the spread as opposing orders fill over time. It c
 
 The actual practice reports specify a 5,000-share order maximum, a $0.01/share fee and a $0.015/share passive rebate. The reports charge commission on all executed shares and credit rebates on passive volume, giving a net $0.005/share credit for a passive fill. Defaults now reflect these reports, and live security metadata overrides them when available.
 
-**Practice status:** v1.1 earned $429.28 and $383.00 in the supplied single-participant reports, both ending flat with no position-limit fines. Their logs exposed immediate cancellation after normal publication delays and an early shutdown after a read timeout. v2.0 adds a 1.5-second known-order publication grace, preserves competitive opposite quotes, paces cancellation retries and resumes after transient read errors. Unknown POST outcomes remain blocked. [Read the evidence and changes](ALGO2_PRACTICE_REVIEW.md). No live P&L improvement is claimed for v2.0 yet.
+**Current ALGO2 version: v3.8.** The bot waits between clean rounds and can refill the opposite quote while a cancellation is pending when fresh order and position checks allow it. The standard command still uses one quote per side; a two-level ladder is optional. See the [ALGO2 changelog](ALGO2_CHANGELOG.md) for each increment.
 
 The market maker follows an observe → price → size → reconcile loop, adjusting quotes for inventory, short-term price variation, and trend. Its [execution walkthrough and code map](ALGO2_README.md#execution-walkthrough) explain the quote engine and order lifecycle.
 
@@ -102,11 +102,11 @@ For ALGO2, Ctrl+C requests cancellation and flattening while the market is activ
 ## Validation
 
 ```powershell
-& ".\.venv\Scripts\python.exe" -m unittest test_algo2
+& ".\.venv\Scripts\python.exe" -m unittest test_algo2 test_algo2_continuous
 & ".\.venv\Scripts\python.exe" -m unittest test_router test_improvements test_audit_events test_late_tenders
 ```
 
-ALGO2's 44 offline tests cover partial fills, position bounds, order visibility, lost responses, persistent reservations, quote behavior, and closeout. ALGO3's 130 offline tests cover tender admission, liquidity estimates, price protection, partial fills, uncertain writes, recovery, order sizing, deadlines, and event auditing. Tests validate controlled execution behavior; they do not establish live profitability, queue performance, or a guaranteed flat finish.
+ALGO2's 92 offline tests cover partial fills, position bounds, order visibility, lost responses, persistent reservations, quote behavior, and closeout. ALGO3's 130 offline tests cover tender admission, liquidity estimates, price protection, partial fills, uncertain writes, recovery, order sizing, deadlines, and event auditing. Tests validate controlled execution behavior; they do not establish live profitability, queue performance, or a guaranteed flat finish.
 
 ### Code quality
 
@@ -133,7 +133,8 @@ Optional development checks use the repository's formatter and import/lint confi
 |---|---|
 | `algo2_market_maker.py` | Standalone ALGO2 bot |
 | `ALGO2_README.md` | ALGO2 setup, strategy and recovery guide |
-| `test_algo2.py` | ALGO2 offline tests |
+| `ALGO2_CHANGELOG.md` | ALGO2 version history |
+| `test_algo2.py`, `test_algo2_continuous.py` | ALGO2 offline tests |
 | `requirements_algo2.txt` | ALGO2 standalone dependency list |
 | `algo3_router.py` | Standalone ALGO3 bot |
 | `ALGO3_README.md` | Detailed ALGO3 technical write-up |
